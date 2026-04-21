@@ -13,6 +13,7 @@
 //   POST /picker/{id}     — user's chosen XML; triggers the docker run
 //   GET  /run/{id}        — single-run detail page (status + live logs)
 //   GET  /run/{id}/logs   — SSE stream of live + persisted logs
+//   GET  /run/{id}/preview/* — reverse-proxied sandbox WebUI (v0.4)
 //   POST /run/{id}/stop   — stops + removes the container
 //   POST /run/{id}/relaunch — re-runs the already-extracted archive
 //   POST /run/{id}/delete — removes the run (container first if running)
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/trstudios/restore-runner/internal/auth"
+	"github.com/trstudios/restore-runner/internal/previewproxy"
 	"github.com/trstudios/restore-runner/internal/sandbox"
 	"github.com/trstudios/restore-runner/internal/upload"
 )
@@ -45,10 +47,12 @@ type Server struct {
 	Logger         *slog.Logger
 	Sandbox        *sandbox.Client
 	Orch           *upload.Orchestrator
+	Proxies        *previewproxy.Registry
 	RunTimeout     time.Duration // auto-stop after this long
 	MemoryBytes    int64
 	CPUs           float64
 	MaxUploadBytes int64
+	HostDeny       []string // extra host path prefixes the sandbox must never touch
 
 	tpl *template.Template
 }
@@ -57,7 +61,9 @@ type Server struct {
 func NewServer(
 	db *sql.DB, logger *slog.Logger,
 	sb *sandbox.Client, orch *upload.Orchestrator,
+	proxies *previewproxy.Registry,
 	runTimeout time.Duration, memBytes int64, cpus float64, maxUpload int64,
+	hostDeny []string,
 ) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -84,12 +90,17 @@ func NewServer(
 	if err != nil {
 		return nil, err
 	}
+	if proxies == nil {
+		proxies = previewproxy.NewRegistry()
+	}
 	return &Server{
 		DB: db, Logger: logger, Sandbox: sb, Orch: orch,
+		Proxies:        proxies,
 		RunTimeout:     runTimeout,
 		MemoryBytes:    memBytes,
 		CPUs:           cpus,
 		MaxUploadBytes: maxUpload,
+		HostDeny:       hostDeny,
 		tpl:            tpl,
 	}, nil
 }
@@ -110,6 +121,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /picker/{id}", s.handlePickerPost)
 	mux.HandleFunc("GET /run/{id}", s.handleRunDetail)
 	mux.HandleFunc("GET /run/{id}/logs", s.handleRunLogs)
+	// Preview proxy: any method, any sub-path. Go 1.22 ServeMux uses
+	// {rest...} to capture the remaining path segments as a single
+	// wildcard. We don't read r.PathValue("rest") — the proxy's
+	// Director rewrites the URL based on the raw r.URL.Path.
+	mux.HandleFunc("/run/{id}/preview", s.handleRunPreview)
+	mux.HandleFunc("/run/{id}/preview/{rest...}", s.handleRunPreview)
 	mux.HandleFunc("POST /run/{id}/stop", s.handleRunStop)
 	mux.HandleFunc("POST /run/{id}/relaunch", s.handleRunRelaunch)
 	mux.HandleFunc("POST /run/{id}/delete", s.handleRunDelete)

@@ -176,6 +176,25 @@ func FindTemplates(root string) ([]*Template, error) {
 	return found, nil
 }
 
+// WebUIPort extracts the container-internal port that the [PORT:nnn]
+// token in the WebUI template refers to. In Unraid XMLs the number
+// inside [PORT:...] is ALWAYS the container port (the XML Target
+// attribute on the matching Port entry). Returns 0 if no [PORT:...]
+// token is found.
+func WebUIPort(webuiRaw string) int {
+	i := strings.Index(webuiRaw, "[PORT:")
+	if i < 0 {
+		return 0
+	}
+	j := strings.Index(webuiRaw[i:], "]")
+	if j < 0 {
+		return 0
+	}
+	num := webuiRaw[i+len("[PORT:") : i+j]
+	n, _ := strconv.Atoi(strings.TrimSpace(num))
+	return n
+}
+
 // ResolveWebUI substitutes [IP] → host, [PORT:nnn] → actualHostPort in the
 // raw WebUI URL template. If the template lacks [PORT:...] we fall back
 // to http://host:port/ so the user still has a clickable link.

@@ -18,11 +18,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/trstudios/restore-runner/internal/auth"
 	"github.com/trstudios/restore-runner/internal/db"
+	"github.com/trstudios/restore-runner/internal/previewproxy"
 	"github.com/trstudios/restore-runner/internal/sandbox"
 	"github.com/trstudios/restore-runner/internal/upload"
 	"github.com/trstudios/restore-runner/internal/web"
@@ -30,7 +32,7 @@ import (
 
 // Build-time metadata, overridable via -ldflags.
 var (
-	version   = "dev"
+	version   = "0.4"
 	commit    = "none"
 	buildTime = "unknown"
 )
@@ -119,6 +121,39 @@ func main() {
 	}
 	pingCancel()
 
+	// --- Sandbox network bring-up (v0.4) ------------------------------
+	// Create the isolated --internal network (idempotent), and connect
+	// ourselves to it so the reverse proxy can reach sandbox IPs. Self-
+	// detection uses os.Hostname() which docker sets to the short
+	// container ID by default. A tolerant warning is logged if either
+	// step fails — the app still boots; the user will see a clear error
+	// when they try to start a sandbox if docker is truly unreachable.
+	netCtx, netCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := sb.EnsureSandboxNetwork(netCtx); err != nil {
+		logger.Warn("ensure sandbox net — sandboxes will fail to start until docker is reachable",
+			"err", err)
+	} else {
+		host, herr := os.Hostname()
+		if herr != nil || host == "" {
+			logger.Warn("cannot detect own container id — reverse proxy may not reach sandbox by IP", "err", herr)
+		} else if err := sb.ConnectSelf(netCtx, host); err != nil {
+			logger.Warn("connect self to sandbox net — preview may be unreachable on hardened docker setups", "err", err)
+		}
+	}
+	netCancel()
+
+	// Optional extra host denylist — path prefixes that the sandbox
+	// must never bind-mount, in addition to the built-in /mnt/user,
+	// /boot, /etc, etc. Comma-separated.
+	var hostDeny []string
+	if v := os.Getenv("RR_HOST_DENY_PREFIXES"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			if t := strings.TrimSpace(p); t != "" {
+				hostDeny = append(hostDeny, t)
+			}
+		}
+	}
+
 	orch := &upload.Orchestrator{
 		DB:       database,
 		BaseDir:  uploadsDir,
@@ -145,7 +180,9 @@ func main() {
 	}
 	sweepCancel()
 
-	srv, err := web.NewServer(database, logger, sb, orch, runTimeout, memoryBytes, cpus, maxBytes)
+	proxies := previewproxy.NewRegistry()
+	srv, err := web.NewServer(database, logger, sb, orch, proxies,
+		runTimeout, memoryBytes, cpus, maxBytes, hostDeny)
 	if err != nil {
 		logger.Error("init web server", "err", err)
 		os.Exit(1)

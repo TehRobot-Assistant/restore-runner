@@ -15,8 +15,7 @@
   <tr><th>Uploaded</th><td>{{fmtTime .Run.UploadedAt}} ({{agoT .Run.UploadedAt}})</td></tr>
   <tr><th>Size</th><td>{{fmtSize .Run.SizeBytes}}</td></tr>
   <tr><th>Image</th><td><code>{{.Run.Image}}</code></td></tr>
-  {{if .Run.HostPort}}<tr><th>Host port</th><td><code>{{.Run.HostPort}}</code></td></tr>{{end}}
-  {{if .Run.WebUIURL}}<tr><th>WebUI template</th><td><code>{{.Run.WebUIURL}}</code></td></tr>{{end}}
+  {{if .Run.HostPort}}<tr><th>WebUI port</th><td><code>{{.Run.HostPort}}</code> (proxied — no host publishing)</td></tr>{{end}}
   {{if .Run.ContainerName}}<tr><th>Container</th><td><code>{{.Run.ContainerName}}</code></td></tr>{{end}}
 </table>
 
@@ -38,6 +37,21 @@
     <button type="submit" class="secondary">Delete</button>
   </form>
 </div>
+
+{{if eq .Run.Status "running"}}
+<h2>Preview</h2>
+<div class="notice">
+  <strong>Sandbox has no internet access</strong> — this container runs on an isolated
+  internal network with no route to your LAN or the public internet. Apps that phone
+  home on first boot may show network errors in their logs. This is intentional.
+  <br>
+  <a href="/run/{{.Run.ID}}/preview/" target="_blank" rel="noopener">Open preview in a new tab</a>
+  — use this fallback if the iframe below stays blank (some apps reject framing
+  regardless of headers).
+</div>
+<iframe src="/run/{{.Run.ID}}/preview/" title="Sandbox WebUI preview"
+        style="width:100%;height:80vh;border:0;border-radius:6px;background:#111"></iframe>
+{{end}}
 
 <h2>Logs</h2>
 <pre id="logs" class="update-output" data-run-id="{{.Run.ID}}"

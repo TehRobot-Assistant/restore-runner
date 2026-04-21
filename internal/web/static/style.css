@@ -263,3 +263,17 @@ table.runs th:last-child, table.runs td:last-child { text-align: right; width: 5
 .stack-row input[type=radio] { margin-top: .35rem; }
 
 .actions { margin: 1rem 0; display: flex; gap: .5rem; flex-wrap: wrap; }
+
+/* Preview notice banner: yellow-on-warm, non-alarming, clearly
+   communicates "sandbox has no internet" without implying error. */
+.notice {
+  padding: .75rem 1rem;
+  border-radius: 6px;
+  margin-bottom: .75rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border));
+  background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+  color: var(--text);
+  font-size: .92rem;
+  line-height: 1.45;
+}
+.notice a { color: var(--accent); }

@@ -12,13 +12,15 @@
   <ReadMe/>
   <Overview>Restore-test your Unraid AppData Backup archives in a click.&#13;
 &#13;
-Upload a backup archive → it extracts → it spins up the backed-up container → you see live logs → one Stop button tears it down.&#13;
+Upload a backup archive → it extracts → it spins up the backed-up container in an isolated sandbox → you preview its WebUI inline → one Stop button tears it down.&#13;
 &#13;
 Supported formats: .zip, .rar, .tar, .tar.gz, .tar.zst&#13;
 &#13;
-Features:&#13;
+Features (v0.4):&#13;
 - Parses Unraid container XML to get image, ports, volumes, env&#13;
-- Random host port mapping so nothing clashes with your live stack&#13;
+- Ephemeral appdata: mounts are rewritten to point at the uploaded archive, never your live /mnt/user/appdata&#13;
+- Isolated internal docker network (rr-sandbox-net): no host ports, no LAN, no internet for the sandbox&#13;
+- WebUI reverse-proxied into the RestoreRunner UI (iframe + open-in-new-tab), WebSocket-capable&#13;
 - Auto-stops after a configurable timeout (default 10 min)&#13;
 - Live log streaming via Server-Sent Events&#13;
 - Relaunch button re-runs extracted archives without re-upload&#13;

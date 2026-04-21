@@ -14,6 +14,7 @@ import (
 
 	"github.com/trstudios/restore-runner/internal/auth"
 	"github.com/trstudios/restore-runner/internal/db"
+	"github.com/trstudios/restore-runner/internal/previewproxy"
 	"github.com/trstudios/restore-runner/internal/sandbox"
 	"github.com/trstudios/restore-runner/internal/unraidxml"
 	"github.com/trstudios/restore-runner/internal/upload"
@@ -287,6 +288,7 @@ func (s *Server) startRun(ctx context.Context, runID string, tpl *unraidxml.Temp
 		ExtractedDir:  extractDir,
 		MemoryBytes:   s.MemoryBytes,
 		CPUs:          s.CPUs,
+		ExtraHostDeny: s.HostDeny,
 	}
 	startCtx, cancel := context.WithTimeout(ctx, 6*time.Minute) // covers image pull
 	defer cancel()
@@ -297,10 +299,31 @@ func (s *Server) startRun(ctx context.Context, runID string, tpl *unraidxml.Temp
 			friendlyDockerError(err))
 		return
 	}
-	webui := unraidxml.ResolveWebUI(tpl.WebUI, "<host>", res.HostPort)
+	// The host_port column in the DB used to hold a real host port.
+	// v0.4 has no host ports — we store the container-internal WebUI
+	// port instead, purely for display ("proxied from :8080"). The
+	// stored webui URL now points at the in-app preview route.
+	previewURL := "/run/" + runID + "/preview/"
 	if err := db.UpdateRunRunning(context.Background(), s.DB, runID,
-		res.ContainerID, res.ContainerName, res.HostPort, webui); err != nil {
+		res.ContainerID, res.ContainerName, res.WebUIPort, previewURL); err != nil {
 		s.Logger.Warn("mark running", "id", runID, "err", err)
+	}
+
+	// Wire up the reverse proxy for this run. Proxy registration must
+	// come BEFORE the user can hit /run/{id}/preview/. The registry
+	// lookup in the handler is instant; the IP resolution happens on
+	// first hit and is cached for the run lifetime.
+	if res.WebUIPort > 0 {
+		proxy, perr := previewproxy.New(
+			previewproxy.Target{ContainerID: res.ContainerID, WebUIPort: res.WebUIPort},
+			"/run/"+runID+"/preview",
+			s.Sandbox.InspectIP,
+		)
+		if perr != nil {
+			s.Logger.Warn("proxy build", "id", runID, "err", perr)
+		} else {
+			s.Proxies.Set(runID, proxy)
+		}
 	}
 
 	// Start log persister. Reads from the live log stream and tees to
@@ -312,12 +335,11 @@ func (s *Server) startRun(ctx context.Context, runID string, tpl *unraidxml.Temp
 	if s.RunTimeout > 0 {
 		go func() {
 			time.Sleep(s.RunTimeout)
-			// Only stop if it's still marked running — user may have
-			// stopped it manually already.
 			if run, err := db.GetRun(context.Background(), s.DB, runID); err == nil && run.Status == "running" {
 				s.Logger.Info("auto-stop timeout", "id", runID)
 				_ = s.Sandbox.Stop(context.Background(), res.ContainerID)
 				_ = db.UpdateRunStopped(context.Background(), s.DB, runID)
+				s.Proxies.Delete(runID)
 			}
 		}()
 	}
@@ -487,7 +509,33 @@ func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = db.UpdateRunStopped(r.Context(), s.DB, id)
+	s.Proxies.Delete(id)
 	http.Redirect(w, r, "/run/"+id, http.StatusSeeOther)
+}
+
+// --- /run/{id}/preview/... (reverse proxy) -------------------------------
+
+// handleRunPreview dispatches every request under /run/{id}/preview/ to
+// the run's sandbox proxy. Auth middleware has already confirmed the
+// session; we additionally refuse previews for non-running runs so a
+// stopped/failed run can't leak a cached proxy.
+func (s *Server) handleRunPreview(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if run.Status != "running" {
+		http.Error(w, "sandbox is not running", http.StatusServiceUnavailable)
+		return
+	}
+	proxy, ok := s.Proxies.Get(id)
+	if !ok {
+		http.Error(w, "preview not ready", http.StatusServiceUnavailable)
+		return
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 // --- /run/{id}/relaunch ---------------------------------------------------
@@ -520,6 +568,9 @@ func (s *Server) handleRunRelaunch(w http.ResponseWriter, r *http.Request) {
 	if run.ContainerID != "" {
 		_ = s.Sandbox.Stop(r.Context(), run.ContainerID)
 	}
+	// Drop the old proxy so the relaunched container's fresh IP is
+	// used (otherwise the cached URL would point at a dead backend).
+	s.Proxies.Delete(id)
 	go s.startRun(detachedContext(), id, tpl, extractDir)
 	http.Redirect(w, r, "/run/"+id, http.StatusSeeOther)
 }
@@ -536,6 +587,7 @@ func (s *Server) handleRunDelete(w http.ResponseWriter, r *http.Request) {
 	if run.ContainerID != "" && run.Status == "running" {
 		_ = s.Sandbox.Stop(r.Context(), run.ContainerID)
 	}
+	s.Proxies.Delete(id)
 	_ = s.Orch.DeleteRunFiles(id)
 	_ = db.DeleteRun(r.Context(), s.DB, id)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
