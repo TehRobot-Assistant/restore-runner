@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Restore-Runner</Name>
+  <Repository>tehrobot/restore-runner:latest</Repository>
+  <Registry>https://hub.docker.com/r/tehrobot/restore-runner</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/TehRobot-Assistant/restore-runner/issues</Support>
+  <Project>https://github.com/TehRobot-Assistant/restore-runner</Project>
+  <ReadMe/>
+  <Overview>Continuous backup verification for restic repos.&#13;
+&#13;
+RestoreRunner captures a point-in-time baseline of your source files&#13;
+(path, size, mtime, SHA-256). On a schedule it samples N files from&#13;
+the backup, pulls them via restic, and hashes them byte-for-byte&#13;
+against the baseline. Tells you whether your backup is restorable,&#13;
+or silently rotting.&#13;
+&#13;
+Features:&#13;
+- Zero-config first run: open the web UI, set an admin, add a repo&#13;
+- Captures baselines on enrollment (rsync-empty-folder safe — compares&#13;
+  against a fixed snapshot, not the live source)&#13;
+- Structural check catches source collapse even when every sampled&#13;
+  file still matches its baseline&#13;
+- Apprise notifications on fail / degraded&#13;
+- Per-repo + fleet CSV export of rehearsal history&#13;
+&#13;
+v0.1 supports restic only. Borg + Kopia coming in v0.2.&#13;
+&#13;
+First-run:&#13;
+- Open the WebUI — wizard asks you to create an admin&#13;
+- Add a backup repo (URL, password, source path)&#13;
+- The baseline capture runs in the background&#13;
+&#13;
+Pre-release — report issues on GitHub.</Overview>
+  <Category>Backup: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8920]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/TehRobot-Assistant/restore-runner/main/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText>If you like my work, please consider a donation!</DonateText>
+  <DonateLink>https://buy.stripe.com/fZe6p67wT53E6NGaEE</DonateLink>
+  <Requires/>
+  <Config Name="Port" Target="8920" Default="8920" Mode="tcp" Description="" Type="Port" Display="always" Required="true" Mask="false">8920</Config>
+  <Config Name="Config Dir" Target="/config" Default="/mnt/user/appdata/restore-runner" Mode="rw" Description="Stores the SQLite DB, master encryption key, and baselines. Do not delete without intention — losing this means re-enrolling every repo." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/restore-runner</Config>
+  <Config Name="Data (read-only)" Target="/srv/data" Default="/mnt/user/data" Mode="ro" Description="Mount your backup source directory as read-only. RestoreRunner only reads from here (to walk the baseline + run structural checks). Add more of these for additional source directories." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/data</Config>
+  <TailscaleStateDir/>
+</Container>

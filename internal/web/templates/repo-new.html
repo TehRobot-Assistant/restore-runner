@@ -1,0 +1,82 @@
+{{define "repo-new-content"}}
+<div class="page-head"><h1>New backup repo</h1></div>
+
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+<form method="post" action="/repos/new" class="stack card">
+  <fieldset>
+    <legend>Repository</legend>
+
+    <label>
+      Name
+      <input type="text" name="name" required maxlength="64" value="{{with .Form}}{{.name}}{{end}}" placeholder="e.g. home-nas">
+      <span class="small muted">Display name. Must be unique.</span>
+    </label>
+
+    <label>
+      Kind
+      <select name="kind">
+        <option value="restic" selected>restic (Borg + Kopia coming in v0.2)</option>
+      </select>
+    </label>
+
+    <label>
+      Repo URL
+      <input type="text" name="repo_url" required value="{{with .Form}}{{.repo_url}}{{end}}"
+             placeholder="/mnt/backups/restic  OR  sftp:user@host:/backups  OR  s3:s3.amazonaws.com/bucket">
+      <span class="small muted">Local path, SFTP URL, S3 URL — whatever you'd pass to <code>restic --repo</code>.</span>
+    </label>
+
+    <label>
+      Repo password
+      <input type="password" name="password" required autocomplete="new-password">
+      <span class="small muted">Stored AES-256-GCM encrypted in <code>/config/restorerunner.db</code> with a per-install master key.</span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Baseline source</legend>
+
+    <label>
+      Source path
+      <input type="text" name="source_path" required value="{{with .Form}}{{.source_path}}{{end}}"
+             placeholder="/srv/data">
+      <span class="small muted">Absolute path to the directory backed up to this repo. RestoreRunner reads (never writes) this path to capture the baseline.</span>
+    </label>
+
+    <label>
+      Exclude globs (one per line)
+      <textarea name="exclude_globs" rows="4" placeholder="*.log&#10;*.db&#10;cache/*">{{with .Form}}{{.exclude}}{{end}}</textarea>
+      <span class="small muted">Files matching these patterns are listed but not hashed or sampled — use for databases, logs, anything mutable. Sensible defaults already applied.</span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Rehearsal cadence</legend>
+
+    <label>
+      Run every (hours)
+      <input type="number" name="cadence_hours" min="1" max="8760" required
+             value="{{with .Form}}{{.cadence}}{{else}}{{.DefaultCadence}}{{end}}">
+      <span class="small muted">168 = weekly. Starts on the schedule after the first manual or automatic run.</span>
+    </label>
+
+    <label>
+      Sample size
+      <input type="number" name="sample_size" min="1" max="10000" required
+             value="{{with .Form}}{{.sample}}{{else}}{{.DefaultSample}}{{end}}">
+      <span class="small muted">Files to pick from the baseline each rehearsal. Larger = stronger evidence, longer runs.</span>
+    </label>
+
+    <label class="checkbox">
+      <input type="checkbox" name="capture_now" checked>
+      Capture baseline now (runs in background; large sources can take a while)
+    </label>
+  </fieldset>
+
+  <div style="display:flex;gap:.75rem;">
+    <button type="submit">Add repo</button>
+    <a href="/" class="secondary button">Cancel</a>
+  </div>
+</form>
+{{end}}

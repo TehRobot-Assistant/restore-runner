@@ -1,0 +1,24 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  {{if .User}}
+  <header>
+    <a href="/" class="brand">RestoreRunner</a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/settings">Settings</a>
+      <form method="post" action="/logout" style="display:inline">
+        <button type="submit" class="linkish">Logout ({{.User.Username}})</button>
+      </form>
+    </nav>
+  </header>
+  {{end}}
+  <main>{{renderBody .Body .}}</main>
+</body>
+</html>{{end}}

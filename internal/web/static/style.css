@@ -1,0 +1,231 @@
+/* PatchPulse — minimal dark-first UI. Warm colours, no serif/italic, matches TR Studios design prefs. */
+:root {
+  color-scheme: dark light;
+  --bg: #14120f;
+  --surface: #1f1c18;
+  --surface-2: #2a2622;
+  --border: #3a342e;
+  --text: #ece5da;
+  --muted: #a39586;
+  --accent: #e4a05b;
+  --ok: #7dc38f;
+  --warn: #d79b4a;
+  --err: #d16e5e;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #faf6ef;
+    --surface: #ffffff;
+    --surface-2: #f1ebe0;
+    --border: #d9cfbe;
+    --text: #26211c;
+    --muted: #705f4c;
+    --accent: #9e5b1e;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.5;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; background: var(--surface-2); padding: 0 .3em; border-radius: 3px; }
+
+header {
+  padding: .9rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+header .brand { font-weight: 600; color: var(--text); font-size: 1.15rem; }
+header nav { display: flex; gap: 1rem; align-items: center; }
+header nav a, header nav .linkish {
+  background: transparent; border: 0; color: var(--muted); font: inherit; cursor: pointer;
+}
+header nav a:hover, header nav .linkish:hover { color: var(--text); text-decoration: none; }
+
+main { max-width: 1000px; margin: 2rem auto; padding: 0 1.5rem; }
+
+h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1.25rem; }
+h2 { font-size: 1.05rem; font-weight: 600; margin: 1.5rem 0 .75rem; }
+
+/* Forms + stacks */
+.stack { display: flex; flex-direction: column; gap: 1rem; }
+.stack label { display: flex; flex-direction: column; gap: .35rem; }
+.stack label.checkbox { flex-direction: row; align-items: center; gap: .5rem; }
+.stack label .small { font-weight: 400; }
+input[type=text], input[type=password], input[type=number], textarea {
+  padding: .55rem .7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+textarea { resize: vertical; min-height: 5rem; font-family: ui-monospace, monospace; font-size: .9em; }
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
+
+button, .run-now button {
+  padding: .55rem 1rem;
+  background: var(--accent);
+  color: #14120f;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.1); }
+
+fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; background: var(--surface); }
+fieldset legend { padding: 0 .5rem; font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+
+/* Cards + blocks */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem 1.75rem;
+}
+.center-card { max-width: 420px; margin: 3rem auto; }
+
+.hint, .ok, .error, .empty {
+  padding: .75rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+  border: 1px solid;
+}
+.hint { background: var(--surface); border-color: var(--border); color: var(--muted); }
+.ok { background: rgba(125, 195, 143, .12); border-color: var(--ok); color: var(--ok); }
+.error { background: rgba(209, 110, 94, .12); border-color: var(--err); color: var(--err); }
+.empty { text-align: center; padding: 2rem; background: var(--surface); border: 1px dashed var(--border); color: var(--muted); }
+
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+th, td { padding: .6rem .8rem; text-align: left; }
+th { background: var(--surface-2); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+tr { border-top: 1px solid var(--border); }
+tr:first-child { border-top: 0; }
+
+/* Status chips. */
+.chip {
+  display: inline-block;
+  padding: .12rem .55rem;
+  border-radius: 999px;
+  font-size: .75rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+  border: 1px solid;
+  background: var(--surface-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.chip-ok     { color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); background: color-mix(in srgb, var(--ok) 12%, var(--surface)); }
+.chip-warn   { color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); }
+.chip-danger { color: var(--err);    border-color: color-mix(in srgb, var(--err) 50%, var(--border));  background: color-mix(in srgb, var(--err) 12%, var(--surface)); }
+.chip-muted  { color: var(--muted);  border-color: var(--border); }
+
+/* Detail-page key/value table. */
+table.kv { border: 0; background: transparent; }
+table.kv th { background: transparent; width: 12rem; vertical-align: top; }
+table.kv tr { border: 0; }
+
+/* Changelog body keeps its content readable but bounded. */
+.changelog {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: .75rem 1.25rem;
+  max-height: 32rem;
+  overflow: auto;
+  font-size: .92rem;
+  line-height: 1.55;
+}
+.changelog h1, .changelog h2, .changelog h3 { font-size: 1rem; margin: 1em 0 .4em; }
+.changelog h1 { font-size: 1.1rem; }
+.changelog ul, .changelog ol { padding-left: 1.4rem; }
+.changelog li { margin: .15em 0; }
+.changelog pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: .6rem .8rem;
+  border-radius: 4px;
+  overflow: auto;
+  font-family: ui-monospace, monospace;
+  font-size: .85rem;
+}
+.changelog code { background: var(--bg); }
+.changelog a { color: var(--accent); }
+.changelog table { margin: .5em 0; }
+.changelog img { max-width: 100%; height: auto; }
+.changelog blockquote {
+  border-left: 3px solid var(--border);
+  margin: .5em 0;
+  padding: .1em 1em;
+  color: var(--muted);
+}
+.changelog hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+
+/* Page header with action buttons next to the h1. */
+.page-head { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+.page-head h1 { margin: 0; margin-right: auto; }
+.page-head form.inline { margin: 0; }
+.last-checked { padding-left: .25rem; }
+
+/* Key/value description list used on the repo detail page. */
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; }
+.card.danger { border: 1px dashed var(--err); }
+
+/* Sortable-table affordance: header text looks clickable + shows direction
+   when sorted. Purely visual; behaviour lives in dashboard.js. */
+table.sortable th.sort-clickable { cursor: pointer; user-select: none; }
+table.sortable th.sort-clickable:hover { color: var(--accent); }
+table.sortable th[aria-sort="ascending"]::after { content: " ↑"; color: var(--accent); }
+table.sortable th[aria-sort="descending"]::after { content: " ↓"; color: var(--accent); }
+button.secondary, a.secondary.button {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: .5rem .9rem;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+button.secondary:hover, a.secondary.button:hover { border-color: var(--accent); filter: none; text-decoration: none; }
+
+/* Update history <details> block on the detail page. */
+.update-history { margin-top: 1rem; }
+.update-history summary { cursor: pointer; color: var(--muted); font-size: .9rem; padding: .3rem 0; }
+.update-history summary:hover { color: var(--text); }
+.update-output {
+  margin-top: .5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: .75rem 1rem;
+  font-family: ui-monospace, monospace;
+  font-size: .8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 24rem;
+  overflow: auto;
+}

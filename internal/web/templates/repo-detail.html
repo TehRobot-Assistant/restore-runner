@@ -1,0 +1,102 @@
+{{define "repo-detail-content"}}
+{{with .Repo}}
+<div class="page-head">
+  <h1>{{.Name}}</h1>
+  <form class="inline" method="post" action="/repo/{{.ID}}/rehearse">
+    <button type="submit" class="secondary">Run rehearsal now</button>
+  </form>
+  <form class="inline" method="post" action="/repo/{{.ID}}/recapture">
+    <button type="submit" class="secondary">Recapture baseline</button>
+  </form>
+  <a class="secondary button" href="/repo/{{.ID}}/rehearsals.csv" download>Export CSV</a>
+  <form class="inline" method="post" action="/repo/{{.ID}}/toggle">
+    <button type="submit" class="secondary">{{if .Enabled}}Disable schedule{{else}}Enable schedule{{end}}</button>
+  </form>
+</div>
+{{end}}
+
+{{if $.FlashRun}}<div class="ok">Rehearsal queued — the scheduler picks it up within a minute.</div>{{end}}
+{{if $.FlashCap}}<div class="ok">Baseline recapture started in the background — refresh in a few minutes to see updated totals.</div>{{end}}
+
+{{with .Repo}}
+<section class="card">
+  <h2>Configuration</h2>
+  <dl class="kv">
+    <dt>Kind</dt><dd><code>{{.Kind}}</code></dd>
+    <dt>Repo URL</dt><dd><code>{{.RepoURL}}</code></dd>
+    <dt>Source path</dt><dd><code>{{.SourcePath}}</code></dd>
+    <dt>Cadence</dt><dd>every {{.CadenceHours}}h</dd>
+    <dt>Sample size</dt><dd>{{.SampleSize}} files per run</dd>
+    <dt>Schedule</dt><dd>{{if .Enabled}}<span class="chip chip-ok">enabled</span>{{else}}<span class="chip chip-muted">disabled</span>{{end}}</dd>
+    {{if .ExcludeGlobs}}<dt>User excludes</dt><dd><pre class="small muted">{{.ExcludeGlobs}}</pre></dd>{{end}}
+  </dl>
+</section>
+
+<section class="card">
+  <h2>Baseline</h2>
+  {{if .BaselineCaptured.IsZero}}
+    <p class="muted">No baseline captured yet. The schedule won't run rehearsals until a baseline exists — click "Recapture baseline" above.</p>
+  {{else}}
+    <dl class="kv">
+      <dt>Captured</dt><dd>{{fmtTime .BaselineCaptured}} ({{agoT .BaselineCaptured}})</dd>
+      <dt>Files recorded</dt><dd>{{.BaselineFiles}} total ({{humanBytes .BaselineBytes}})</dd>
+      <dt>Hashable</dt><dd>{{.BaselineHashable}} files (rest matched mutable-file excludes and are skipped from sampling)</dd>
+    </dl>
+  {{end}}
+</section>
+
+<section class="card">
+  <h2>Rehearsals <span class="muted small">(last {{len .Rehearsals}})</span></h2>
+  {{if not .Rehearsals}}
+    <p class="muted">No rehearsal runs yet. Click "Run rehearsal now" above to trigger one.</p>
+  {{else}}
+    <table class="containers sortable">
+      <thead>
+        <tr>
+          <th data-sort="number">Started</th>
+          <th data-sort="string">Status</th>
+          <th data-sort="number">Sample</th>
+          <th data-sort="number">Matched</th>
+          <th data-sort="number">Diverged</th>
+          <th data-sort="number">Missing</th>
+          <th data-sort="number">Live files</th>
+          <th data-sort="string">Trigger</th>
+          <th data-sort="string">Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+      {{range .Rehearsals}}
+        <tr>
+          <td data-sort-value="{{.StartedAt.Unix}}">{{fmtTime .StartedAt}}</td>
+          <td data-sort-value="{{.Status}}">
+            {{if eq .Status "pass"}}<span class="chip chip-ok">pass</span>
+            {{else if eq .Status "degraded"}}<span class="chip chip-warn">degraded</span>
+            {{else if eq .Status "fail"}}<span class="chip chip-danger">fail</span>
+            {{else}}<span class="chip chip-muted">{{.Status}}</span>{{end}}
+          </td>
+          <td data-sort-value="{{.SampledCount}}">{{.SampledCount}}</td>
+          <td data-sort-value="{{.MatchedCount}}">{{.MatchedCount}}</td>
+          <td data-sort-value="{{.DivergedCount}}">{{.DivergedCount}}</td>
+          <td data-sort-value="{{.MissingCount}}">{{.MissingCount}}</td>
+          <td data-sort-value="{{.LiveFileCount}}">{{.LiveFileCount}}</td>
+          <td data-sort-value="{{.TriggeredBy}}"><code>{{.TriggeredBy}}</code></td>
+          <td>{{.Detail}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  {{end}}
+</section>
+
+<section class="card danger">
+  <h2>Danger zone</h2>
+  <p class="muted small">Delete this repo and all of its baseline + rehearsal history. The underlying restic repo is <strong>not</strong> touched. Re-type the repo name (<code>{{.Name}}</code>) to confirm.</p>
+  <form method="post" action="/repo/{{.ID}}/delete" class="inline">
+    <input type="text" name="confirm_name" placeholder="type name to confirm" required style="width:14rem;">
+    <button type="submit" class="secondary">Delete repo</button>
+  </form>
+</section>
+{{end}}
+
+<script src="/static/dashboard.js" defer></script>
+{{end}}
