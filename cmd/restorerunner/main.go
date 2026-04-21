@@ -1,29 +1,34 @@
-// restorerunner binary. Serves the web UI + runs the rehearsal scheduler.
+// Command restorerunner — upload an Unraid AppData backup archive, boot
+// the captured container in a sandbox, watch its logs, one click to stop.
 //
-// v0.1 shape:
-//
-//	restorerunner serve        start the server (default)
-//	restorerunner version      print build info
+// Runtime contract (matches every TR Studios app):
+//   - Single data directory at /config.
+//   - No YAML config. Tunables via env vars; admin via web wizard.
+//   - Binds 0.0.0.0:8922 inside the container; host-port mapping gates
+//     external exposure.
+//   - Needs /var/run/docker.sock mounted to do its job — refuses to
+//     start containers otherwise (with a friendly error).
 package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/trstudios/restore-runner/internal/auth"
 	"github.com/trstudios/restore-runner/internal/db"
-	"github.com/trstudios/restore-runner/internal/notify"
-	"github.com/trstudios/restore-runner/internal/scheduler"
+	"github.com/trstudios/restore-runner/internal/sandbox"
+	"github.com/trstudios/restore-runner/internal/upload"
 	"github.com/trstudios/restore-runner/internal/web"
 )
 
+// Build-time metadata, overridable via -ldflags.
 var (
 	version   = "dev"
 	commit    = "none"
@@ -31,105 +36,172 @@ var (
 )
 
 func main() {
-	if err := run(os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	configPath := envOr("CONFIG_PATH", "/config")
+	port, _ := strconv.Atoi(envOr("PORT", "8922"))
+	if port == 0 {
+		port = 8922
+	}
+	dockerSocket := envOr("DOCKER_HOST", "/var/run/docker.sock")
+	dockerSocket = stripUnixScheme(dockerSocket)
+
+	envAdminUser := envOr("ADMIN_USERNAME", "admin")
+	envAdminPass := os.Getenv("ADMIN_PASSWORD")
+
+	// RR_MAX_UPLOAD_MB caps the archive size in MiB.
+	maxMB, _ := strconv.Atoi(envOr("RR_MAX_UPLOAD_MB", "2048"))
+	if maxMB <= 0 {
+		maxMB = 2048
+	}
+	maxBytes := int64(maxMB) * 1024 * 1024
+
+	// RR_RUN_TIMEOUT_MIN auto-stops containers after N minutes.
+	timeoutMin, _ := strconv.Atoi(envOr("RR_RUN_TIMEOUT_MIN", "10"))
+	if timeoutMin <= 0 {
+		timeoutMin = 10
+	}
+	runTimeout := time.Duration(timeoutMin) * time.Minute
+
+	// Resource caps for sandboxed containers.
+	memoryBytes := int64(1 << 30) // 1 GiB
+	cpus := 1.0
+
+	if err := os.MkdirAll(configPath, 0o755); err != nil {
+		logger.Error("make config dir", "path", configPath, "err", err)
 		os.Exit(1)
 	}
-}
-
-func run(args []string) error {
-	if len(args) >= 2 {
-		switch args[1] {
-		case "version":
-			fmt.Printf("restorerunner %s (commit=%s, built=%s)\n", version, commit, buildTime)
-			return nil
-		case "serve", "":
-			// fallthrough
-		default:
-			return fmt.Errorf("unknown command %q (use: serve, version)", args[1])
-		}
+	uploadsDir := filepath.Join(configPath, "uploads")
+	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
+		logger.Error("make uploads dir", "path", uploadsDir, "err", err)
+		os.Exit(1)
 	}
 
-	cfgDir := envOr("RR_CONFIG_DIR", "/config")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", cfgDir, err)
-	}
-	dbPath := filepath.Join(cfgDir, "restorerunner.db")
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
+	dbPath := filepath.Join(configPath, "restorerunner.db")
 	database, err := db.Open(dbPath)
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		logger.Error("open database", "path", dbPath, "err", err)
+		os.Exit(1)
 	}
 	defer database.Close()
 
-	port := intEnv("RR_PORT", 8920)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Load configured apprise URLs for the notifier. Fresh on every load so
-	// settings changes take effect on next scheduler sweep (no restart).
-	var appriseURLs []string
-	_ = db.SettingGetJSON(ctx, database, db.KeyAppriseURLs, &appriseURLs)
-	notifier := notify.New(appriseURLs, logger)
-
-	sch := &scheduler.Scheduler{DB: database, Logger: logger, Notifier: notifier}
-	go sch.Run(ctx)
-
-	server, err := web.NewServer(database, logger, sch)
-	if err != nil {
-		return fmt.Errorf("new server: %w", err)
+	ctx := context.Background()
+	if err := auth.BootstrapAdminFromEnv(ctx, database, envAdminUser, envAdminPass); err != nil {
+		logger.Error("bootstrap admin", "err", err)
+		os.Exit(1)
 	}
-	listener, err := server.Listen(port)
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+	if adminExists, _ := auth.AdminExists(ctx, database); adminExists {
+		if envAdminPass != "" {
+			logger.Info("admin seeded from ADMIN_PASSWORD env", "username", envAdminUser)
+		} else {
+			logger.Info("admin already configured")
+		}
+	} else {
+		logger.Info("no admin yet — browse to the UI to create one via /setup")
 	}
+
+	// Docker client. We don't fail the whole app if the socket is
+	// missing at startup — the health endpoint still works so Docker's
+	// own healthcheck passes, and the UI surfaces a friendly error
+	// when the user tries to start a container.
+	sb, err := sandbox.NewClient(dockerSocket)
+	if err != nil {
+		logger.Error("docker client init", "err", err)
+		os.Exit(1)
+	}
+	defer sb.Close()
+
+	pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+	if err := sb.Ping(pingCtx); err != nil {
+		logger.Warn("docker socket unreachable at startup — check that /var/run/docker.sock is mounted",
+			"socket", dockerSocket, "err", err)
+	}
+	pingCancel()
+
+	orch := &upload.Orchestrator{
+		DB:       database,
+		BaseDir:  uploadsDir,
+		MaxBytes: maxBytes,
+	}
+
+	// --- Orphan sweep on startup ---------------------------------------
+	// A previous crash or restart may have left rr-* containers behind,
+	// or runs marked "running" with no matching container. Reconcile.
+	sweepCtx, sweepCancel := context.WithTimeout(ctx, 15*time.Second)
+	// Keep IDs is intentionally empty — we're restarting fresh; any
+	// container labeled with com.trstudios.restorerunner from a previous
+	// session is orphan.
+	if removed, err := sb.SweepOrphans(sweepCtx, map[string]bool{}); err != nil {
+		logger.Warn("orphan sweep", "err", err)
+	} else if len(removed) > 0 {
+		logger.Info("orphan containers swept", "names", removed)
+	}
+	// Flip any "running" DB rows to "stopped" since no corresponding
+	// container exists anymore.
+	runningIDs, _ := db.ListRunningRunIDs(sweepCtx, database)
+	for _, id := range runningIDs {
+		_ = db.UpdateRunStopped(sweepCtx, database, id)
+	}
+	sweepCancel()
+
+	srv, err := web.NewServer(database, logger, sb, orch, runTimeout, memoryBytes, cpus, maxBytes)
+	if err != nil {
+		logger.Error("init web server", "err", err)
+		os.Exit(1)
+	}
+	listener, err := srv.Listen(port)
+	if err != nil {
+		logger.Error("bind port", "port", port, "err", err)
+		os.Exit(1)
+	}
+
+	// Upload endpoint can take minutes for multi-GB archives → generous
+	// write timeout. SSE log stream holds connections open → don't
+	// aggressively idle-close.
+	httpSrv := &http.Server{
+		Handler:      srv.Handler(),
+		ReadTimeout:  0, // uploads can be slow; rely on MaxBytesReader + context
+		WriteTimeout: 0, // SSE streams; finite per-handler timers instead
+		IdleTimeout:  120 * time.Second,
+	}
+
 	logger.Info("restorerunner starting",
-		"version", version, "commit", commit, "port", port,
-		"config", cfgDir, "db", dbPath)
-
-	srv := &http.Server{
-		Handler:           server.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+		"version", version, "commit", commit, "buildTime", buildTime,
+		"port", port, "config", configPath, "db", dbPath,
+		"dockerSocket", dockerSocket,
+		"maxUploadMB", maxMB, "runTimeoutMin", timeoutMin)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(listener) }()
+	go func() { errCh <- httpSrv.Serve(listener) }()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	select {
 	case err := <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("http server", "err", err)
+			os.Exit(1)
 		}
-	case sig := <-sigCh:
-		logger.Info("shutdown signal", "sig", sig.String())
-		shutdownCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
-		defer c()
-		_ = srv.Shutdown(shutdownCtx)
-		cancel()
+	case s := <-sig:
+		logger.Info("shutdown signal", "signal", s)
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutCancel()
+		_ = httpSrv.Shutdown(shutCtx)
 	}
-	return nil
 }
 
-func envOr(key, def string) string {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	return def
+	return fallback
 }
 
-func intEnv(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func stripUnixScheme(s string) string {
+	const p = "unix://"
+	if len(s) > len(p) && s[:len(p)] == p {
+		return s[len(p):]
 	}
-	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		return def
-	}
-	return n
+	return s
 }

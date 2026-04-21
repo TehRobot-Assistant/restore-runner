@@ -77,3 +77,32 @@
     return Math.floor(d / 86400) + 'd ago';
   }
 })();
+
+// --- Drop-zone upload (RestoreRunner) ---------------------------------------
+(function(){
+  var dz = document.getElementById('dropzone');
+  var inp = document.getElementById('archive-input');
+  var fn = document.getElementById('dropzone-filename');
+  if (!dz || !inp) return;
+
+  dz.addEventListener('dragover', function(ev){
+    ev.preventDefault();
+    dz.classList.add('dragover');
+  });
+  dz.addEventListener('dragleave', function(){ dz.classList.remove('dragover'); });
+  dz.addEventListener('drop', function(ev){
+    ev.preventDefault();
+    dz.classList.remove('dragover');
+    if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files.length > 0) {
+      inp.files = ev.dataTransfer.files;
+      update();
+    }
+  });
+  inp.addEventListener('change', update);
+
+  function update(){
+    if (fn && inp.files && inp.files[0]) {
+      fn.textContent = 'Selected: ' + inp.files[0].name;
+    }
+  }
+})();

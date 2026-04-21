@@ -1,19 +1,5 @@
-# Build output
-/out/
-/dist/
-
-# Local test DB / scratch
+/config
 *.db
-*.sqlite*
-.secrets/
-
-# Editor
-.vscode/
-.idea/
-
-# OS
+*.db-wal
+*.db-shm
 .DS_Store
-Thumbs.db
-
-# Go
-vendor/

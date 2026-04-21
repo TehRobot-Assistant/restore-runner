@@ -2,25 +2,19 @@
 <div class="card center-card">
   <h1>Welcome to RestoreRunner</h1>
   <p class="muted">Create an admin account to get started. You'll use these credentials to log in.</p>
-
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-
   <form method="post" action="/setup" class="stack">
-    <label>
-      Username
+    <label>Username
       <input type="text" name="username" required autofocus value="{{.Username}}" autocomplete="username">
     </label>
-    <label>
-      Password
+    <label>Password
       <input type="password" name="password" required minlength="8" autocomplete="new-password">
     </label>
-    <label>
-      Confirm password
+    <label>Confirm password
       <input type="password" name="confirm" required minlength="8" autocomplete="new-password">
     </label>
     <button type="submit">Create admin and continue</button>
   </form>
-
-  <p class="small muted">Password is stored bcrypt-hashed in a local SQLite database under /config. You can change it from Settings after login.</p>
+  <p class="small muted">Password is stored bcrypt-hashed in a local SQLite database under /config.</p>
 </div>
 {{end}}

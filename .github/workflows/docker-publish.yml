@@ -1,8 +1,7 @@
 name: Build and Push Docker Image
 
-# Push to main → publishes :latest
-# Push a git tag like v0.1.0 → publishes :0.1.0 + :0.1 + :latest
-# Manual dispatch also supported.
+# Push to master → publishes :latest
+# Push a git tag like v0.3.0 → publishes :0.3.0 + :0.3 + :latest
 
 on:
   push:
@@ -76,4 +75,4 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
           readme-filepath: ./DOCKERHUB.md
-          short-description: "Continuous backup verification — prove your restic repo is restorable"
+          short-description: "Upload an Unraid AppData backup, boot it, watch logs, one-click stop"

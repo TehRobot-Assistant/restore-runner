@@ -1,32 +1,39 @@
 # RestoreRunner
 
-**Continuous backup verification.** Captures a point-in-time baseline of your source files, then periodically pulls a sample from the backup and compares it byte-for-byte to the baseline. Tells you whether your backup is restorable, or silently rotting.
+Upload an Unraid AppData Backup archive, boot the captured container in a
+sandbox, watch its logs, one click to stop.
 
-**v0.1 — restic only.** Borg + Kopia in v0.2.
-
-## Run
+## Quick start
 
 ```bash
-docker run -d --name restore-runner --restart unless-stopped \
-  -p 127.0.0.1:8920:8920 \
-  -v ./config:/config \
-  -v /mnt/user/data:/srv/data:ro \
+docker run -d \
+  --name restore-runner \
+  -p 8922:8922 \
+  -v $(pwd)/config:/config \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   tehrobot/restore-runner:latest
 ```
 
-Open `http://<host>:8920/`. Wizard creates an admin, then you add a repo.
+Open `http://<host>:8922` — create your admin via the first-run wizard,
+then drop a `.zip` / `.rar` / `.tar` / `.tar.gz` / `.tar.zst` archive
+onto the page.
 
-## Why this exists
+## Why
 
-Every self-hoster backs up. Almost nobody verifies restores. Canonical failures:
-- **rsync has been copying an empty folder for 8 weeks.** Nobody notices.
-- **Restic snapshot can't be decrypted** after a key rotation.
-- **S3 lifecycle policy moved old snapshots to Glacier** — listed, no longer restorable in <3 hrs.
+Are your backups actually restorable? Find out in one click without
+committing to a full restore into your live stack. Runs the recovered
+container on a random host port with `--memory=1g --cpus=1.0
+--cap-drop=ALL --security-opt no-new-privileges`, auto-stops after 10
+minutes.
 
-`restic check --read-data` verifies the repo is internally consistent. It doesn't answer: **"if I had to restore, could I actually get the files back, identical to what I backed up?"**
+## Tunables
 
-RestoreRunner does.
+- `RR_MAX_UPLOAD_MB` (default `2048`)
+- `RR_RUN_TIMEOUT_MIN` (default `10`)
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD` — optional non-interactive admin seed
 
-## License
+## Source + issues
 
-MIT. [Source on GitHub.](https://github.com/TehRobot-Assistant/restore-runner)
+https://github.com/TehRobot-Assistant/restore-runner
+
+Licensed MIT.

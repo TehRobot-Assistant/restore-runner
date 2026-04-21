@@ -1,30 +1,29 @@
-# Pull-and-run compose for RestoreRunner. Mirrors docker-manager /
-# patch-pulse shape. Security posture compensates for running as root
-# inside the container.
+# RestoreRunner — upload an Unraid AppData backup, boot it, watch logs.
+#
+# Zero-config install:
+#   1. docker compose up -d
+#   2. Open http://<host>:8922 — create admin via the first-run wizard
+#
+# No YAML app config. Settings are env vars + the web UI.
 
 services:
   restore-runner:
     image: tehrobot/restore-runner:latest
     container_name: restore-runner
-    restart: unless-stopped
-    # Compose-level security constraints — these compensate for root-in-container.
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop: [ALL]
     ports:
-      - "127.0.0.1:8920:8920"
+      - "8922:8922"
     volumes:
-      # All app state (SQLite DB, master key, baselines) lives here.
+      # Single data volume: SQLite DB + extracted uploads + persisted logs.
       - ./config:/config
-      # Mount whatever backup source paths you want to verify as READ-ONLY.
-      # RestoreRunner never writes to these.
-      # - /mnt/user/data:/srv/data:ro
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8920/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      # Docker socket is MANDATORY. Without it the app can't boot the
+      # captured container — that's its entire job.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Optional tunables:
+      # - RR_MAX_UPLOAD_MB=2048
+      # - RR_RUN_TIMEOUT_MIN=10
+      # Optional admin seed (skip the web wizard):
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=changeme
+      TZ: Etc/UTC
+    restart: unless-stopped

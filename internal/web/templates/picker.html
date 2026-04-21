@@ -1,0 +1,14 @@
+{{define "picker-content"}}
+<div class="page-head"><h1>Pick a template</h1></div>
+<p class="muted">Your archive (<code>{{.Run.OriginalName}}</code>) contains more than one Unraid container XML. Pick the one to boot.</p>
+<form method="post" action="/picker/{{.Run.ID}}" class="stack">
+  {{range $i, $o := .Options}}
+  <label class="stack-row">
+    <input type="radio" name="xml" value="{{$o.RelPath}}"{{if eq $i 0}} checked{{end}}>
+    <span><strong>{{$o.Name}}</strong> — <code>{{$o.Repository}}</code><br>
+      <span class="muted small">{{$o.RelPath}}</span></span>
+  </label>
+  {{end}}
+  <button type="submit">Start this container</button>
+</form>
+{{end}}

@@ -1,15 +1,8 @@
 // Package auth owns: admin user bootstrap, password hashing, session
 // cookies, and the HTTP middleware that gates every request.
 //
-// Three things make this the "Jellyfin-style" pattern, not "YAML
-// config-file-password" pattern:
-//
-//  1. On first run, if the user set ADMIN_PASSWORD as an env var we
-//     create the admin non-interactively. Matches tehrobot/docker-manager.
-//  2. If no ADMIN_PASSWORD env var is set and no admin exists, the UI
-//     redirects every request to /setup where the user creates the admin
-//     in-browser. Matches Jellyfin, Sonarr, Vaultwarden.
-//  3. There is never a YAML file containing auth config. Period.
+// Copied wholesale from patch-pulse and renamed. Docker-socket access in
+// RestoreRunner means auth is mandatory — no opt-out.
 package auth
 
 import (
@@ -40,9 +33,8 @@ var ErrInvalidLogin = errors.New("invalid username or password")
 
 // User represents a row of the users table.
 type User struct {
-	ID       int64
-	Username string
-	// PasswordHash is a bcrypt hash, never the plaintext.
+	ID           int64
+	Username     string
 	PasswordHash string
 	MustChange   bool
 	CreatedAt    time.Time
@@ -56,10 +48,7 @@ func AdminExists(ctx context.Context, d *sql.DB) (bool, error) {
 }
 
 // BootstrapAdminFromEnv creates the first admin user from the
-// ADMIN_PASSWORD env var if (and only if) no admin exists yet. Username
-// defaults to ADMIN_USERNAME (or "admin"). Does nothing if an admin is
-// already set up. `mustChange` is true when the env-seeded password
-// is still the default — we nag the user to rotate it.
+// ADMIN_PASSWORD env var if no admin exists yet.
 func BootstrapAdminFromEnv(ctx context.Context, d *sql.DB, envUsername, envPassword string) error {
 	exists, err := AdminExists(ctx, d)
 	if err != nil {
@@ -82,9 +71,7 @@ func BootstrapAdminFromEnv(ctx context.Context, d *sql.DB, envUsername, envPassw
 	return err
 }
 
-// CreateAdmin creates an admin user from the web-UI /setup form. Fails
-// if an admin already exists (prevents the UI from stamping over an
-// existing user via CSRF or similar).
+// CreateAdmin creates an admin user from the web-UI /setup form.
 func CreateAdmin(ctx context.Context, d *sql.DB, username, password string) (*User, error) {
 	exists, err := AdminExists(ctx, d)
 	if err != nil {
@@ -141,22 +128,6 @@ func Authenticate(ctx context.Context, d *sql.DB, username, password string) (*U
 	return &u, nil
 }
 
-// ChangePassword updates a user's password and clears the must_change flag.
-func ChangePassword(ctx context.Context, d *sql.DB, userID int64, newPassword string) error {
-	if len(newPassword) < 8 {
-		return errors.New("password must be at least 8 characters")
-	}
-	hashed, err := HashPassword(newPassword)
-	if err != nil {
-		return err
-	}
-	_, err = d.ExecContext(ctx,
-		`UPDATE users SET password_hash=?, must_change=0 WHERE id=?`, hashed, userID)
-	return err
-}
-
-// --- Sessions --------------------------------------------------------------
-
 // CreateSession issues a new session cookie for the given user.
 func CreateSession(ctx context.Context, d *sql.DB, userID int64) (string, error) {
 	token, err := randomToken(32)
@@ -173,8 +144,7 @@ func CreateSession(ctx context.Context, d *sql.DB, userID int64) (string, error)
 	return token, nil
 }
 
-// LookupSession returns the user attached to a session token, or
-// ErrNotFound if absent / expired.
+// LookupSession returns the user attached to a session token.
 func LookupSession(ctx context.Context, d *sql.DB, token string) (*User, error) {
 	row := d.QueryRowContext(ctx, `
 		SELECT u.id, u.username, u.password_hash, u.must_change, u.created_at, s.expires_at
@@ -194,7 +164,6 @@ func LookupSession(ctx context.Context, d *sql.DB, token string) (*User, error) 
 		_, _ = d.ExecContext(ctx, `DELETE FROM sessions WHERE token=?`, token)
 		return nil, db.ErrNotFound
 	}
-	// Sliding expiry: extend session on use.
 	_, _ = d.ExecContext(ctx,
 		`UPDATE sessions SET last_used_at=?, expires_at=? WHERE token=?`,
 		time.Now().Unix(), time.Now().Add(SessionTTL).Unix(), token)

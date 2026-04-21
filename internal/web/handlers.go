@@ -2,18 +2,21 @@ package web
 
 import (
 	"context"
-	"database/sql"
-	"encoding/csv"
 	"errors"
-	"html/template"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/trstudios/restore-runner/internal/auth"
-	"github.com/trstudios/restore-runner/internal/baseline"
 	"github.com/trstudios/restore-runner/internal/db"
-	"github.com/trstudios/restore-runner/internal/restic"
+	"github.com/trstudios/restore-runner/internal/sandbox"
+	"github.com/trstudios/restore-runner/internal/unraidxml"
+	"github.com/trstudios/restore-runner/internal/upload"
 )
 
 // --- /setup (first-run admin bootstrap) -----------------------------------
@@ -28,89 +31,80 @@ func (s *Server) handleSetupGet(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	s.renderPage(w, "Welcome to RestoreRunner", "setup-content", map[string]any{})
+	s.renderPage(w, "RestoreRunner — First-Run Setup", "setup-content",
+		map[string]any{"Error": ""})
 }
 
 func (s *Server) handleSetupPost(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	exists, _ := auth.AdminExists(ctx, s.DB)
+	exists, _ := auth.AdminExists(r.Context(), s.DB)
 	if exists {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
 	confirm := r.FormValue("confirm")
-
-	errMsg := ""
-	switch {
-	case username == "":
-		errMsg = "Username required."
-	case len(password) < 8:
-		errMsg = "Password must be at least 8 characters."
-	case password != confirm:
-		errMsg = "Passwords don't match."
-	}
-	if errMsg != "" {
-		s.renderPage(w, "Welcome to RestoreRunner", "setup-content", map[string]any{
-			"Error":    errMsg,
-			"Username": username,
-		})
+	if password != confirm {
+		s.renderPage(w, "RestoreRunner — First-Run Setup", "setup-content",
+			map[string]any{"Error": "Passwords don't match.", "Username": username})
 		return
 	}
-	u, err := auth.CreateAdmin(ctx, s.DB, username, password)
+	user, err := auth.CreateAdmin(r.Context(), s.DB, username, password)
 	if err != nil {
-		s.renderPage(w, "Welcome to RestoreRunner", "setup-content", map[string]any{
-			"Error":    "Could not create admin: " + err.Error(),
-			"Username": username,
-		})
+		s.renderPage(w, "RestoreRunner — First-Run Setup", "setup-content",
+			map[string]any{"Error": err.Error(), "Username": username})
 		return
 	}
-	// Master key gets generated on first use; preseed here so the /repos/new
-	// flow doesn't have to handle a first-time race.
-	if _, err := db.EnsureMasterKey(ctx, s.DB); err != nil {
-		s.Logger.Warn("ensure master key at setup", "err", err)
+	tok, err := auth.CreateSession(r.Context(), s.DB, user.ID)
+	if err != nil {
+		http.Error(w, "session error", http.StatusInternalServerError)
+		return
 	}
-	if token, err := auth.CreateSession(ctx, s.DB, u.ID); err == nil {
-		auth.SetSessionCookie(w, token)
-	}
+	auth.SetSessionCookie(w, tok)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // --- /login + /logout -----------------------------------------------------
 
 func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
-	if u := auth.UserFromContext(r.Context()); u != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil {
+		if user, err := auth.LookupSession(r.Context(), s.DB, cookie.Value); err == nil && user != nil {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
 	}
-	s.renderPage(w, "Log in — RestoreRunner", "login-content", map[string]any{})
+	s.renderPage(w, "Sign in — RestoreRunner", "login-content", map[string]any{"Error": ""})
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	_ = r.ParseForm()
-	username := strings.TrimSpace(r.FormValue("username"))
-	password := r.FormValue("password")
-	u, err := auth.Authenticate(ctx, s.DB, username, password)
-	if err != nil || u == nil {
-		s.renderPage(w, "Log in — RestoreRunner", "login-content", map[string]any{
-			"Error":    "Invalid username or password.",
-			"Username": username,
-		})
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	if token, err := auth.CreateSession(ctx, s.DB, u.ID); err == nil {
-		auth.SetSessionCookie(w, token)
+	username := strings.TrimSpace(r.FormValue("username"))
+	password := r.FormValue("password")
+	user, err := auth.Authenticate(r.Context(), s.DB, username, password)
+	if err != nil {
+		s.renderPage(w, "Sign in — RestoreRunner", "login-content",
+			map[string]any{"Error": "Invalid username or password.", "Username": username})
+		return
 	}
+	tok, err := auth.CreateSession(r.Context(), s.DB, user.ID)
+	if err != nil {
+		http.Error(w, "session error", http.StatusInternalServerError)
+		return
+	}
+	auth.SetSessionCookie(w, tok)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	// Pull the current session token from the cookie and delete it.
-	if c, err := r.Cookie(auth.SessionCookieName); err == nil {
-		_ = auth.DeleteSession(r.Context(), s.DB, c.Value)
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil {
+		_ = auth.DeleteSession(r.Context(), s.DB, cookie.Value)
 	}
 	auth.ClearSessionCookie(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -119,676 +113,467 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // --- /health --------------------------------------------------------------
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if err := s.DB.PingContext(r.Context()); err != nil {
+		http.Error(w, "db down", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true,"ts":"` + time.Now().UTC().Format(time.RFC3339) + `"}`))
 }
 
 // --- / (dashboard) --------------------------------------------------------
 
-type dashboardRow struct {
-	ID              int64
-	Name            string
-	Kind            string
-	RepoURL         string
-	SourcePath      string
-	Enabled         bool
-	CadenceHours    int
-	SampleSize      int
-	LastRehearsedAt time.Time
-	LastStatus      string // '' | 'pass' | 'degraded' | 'fail'
-	NextDueAt       time.Time
-	BaselineFiles   int64
-	BaselineBytes   int64
-}
-
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFromContext(r.Context())
-
-	rows, err := s.DB.QueryContext(r.Context(), `
-		SELECT r.id, r.name, r.kind, r.repo_url, r.source_path, r.enabled,
-		       r.cadence_hours, r.sample_size,
-		       r.last_rehearsed_at, COALESCE(r.last_status, ''),
-		       COALESCE(b.file_count, 0), COALESCE(b.total_bytes, 0)
-		FROM repos r
-		LEFT JOIN baselines b ON b.repo_id = r.id
-		ORDER BY r.name
-	`)
+	runs, err := db.ListRuns(r.Context(), s.DB)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	var list []dashboardRow
-	for rows.Next() {
-		var row dashboardRow
-		var enabled int
-		var lastUnix int64
-		if err := rows.Scan(&row.ID, &row.Name, &row.Kind, &row.RepoURL, &row.SourcePath,
-			&enabled, &row.CadenceHours, &row.SampleSize,
-			&lastUnix, &row.LastStatus,
-			&row.BaselineFiles, &row.BaselineBytes); err != nil {
-			continue
-		}
-		row.Enabled = enabled == 1
-		if lastUnix > 0 {
-			row.LastRehearsedAt = time.Unix(lastUnix, 0)
-			row.NextDueAt = row.LastRehearsedAt.Add(time.Duration(row.CadenceHours) * time.Hour)
-		}
-		list = append(list, row)
+	// MaxUploadMiB in the UI helps the client-side drop-zone reject
+	// oversize files before uploading.
+	maxMiB := int64(0)
+	if s.MaxUploadBytes > 0 {
+		maxMiB = s.MaxUploadBytes / (1024 * 1024)
 	}
-
-	// "Last rehearsal" across all repos for the header timer.
-	var lastUnix int64
-	_ = s.DB.QueryRowContext(r.Context(),
-		`SELECT COALESCE(MAX(finished_at), 0) FROM rehearsals`).Scan(&lastUnix)
-	var lastRehearsal time.Time
-	if lastUnix > 0 {
-		lastRehearsal = time.Unix(lastUnix, 0)
-	}
-
-	firstRun := len(list) == 0
-
-	s.renderPage(w, "RestoreRunner — Dashboard", "dashboard-content", map[string]any{
-		"User":              user,
-		"Repos":             list,
-		"FirstRun":          firstRun,
-		"LastRehearsal":     lastRehearsal,
-		"LastRehearsalUnix": lastUnix,
-		"FlashAdded":        r.URL.Query().Get("added") == "1",
-		"FlashRehearsing":   r.URL.Query().Get("rehearsing") == "1",
+	s.renderPage(w, "RestoreRunner", "dashboard-content", map[string]any{
+		"User":       user,
+		"Runs":       runs,
+		"MaxUploadMiB": maxMiB,
+		"Flash":      r.URL.Query().Get("flash"),
+		"FlashErr":   r.URL.Query().Get("err"),
 	})
 }
 
-// --- /repos/new (add-repo wizard) -----------------------------------------
+// --- /upload --------------------------------------------------------------
 
-func (s *Server) handleRepoNewGet(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	defaultCadence := db.SettingGetInt(r.Context(), s.DB, db.KeyDefaultCadenceHours, 168)
-	defaultSample := db.SettingGetInt(r.Context(), s.DB, db.KeyDefaultSampleSize, 30)
-	s.renderPage(w, "New backup repo — RestoreRunner", "repo-new-content", map[string]any{
-		"User":           user,
-		"DefaultCadence": defaultCadence,
-		"DefaultSample":  defaultSample,
-	})
-}
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Enforce server-side cap even if the client sends a misleading
+	// Content-Length. Orchestrator also caps per-part read.
+	r.Body = http.MaxBytesReader(w, r.Body, s.MaxUploadBytes+1<<20) // +1MiB slack for multipart overhead
 
-func (s *Server) handleRepoNewPost(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	user := auth.UserFromContext(ctx)
-	_ = r.ParseForm()
-
-	form := map[string]string{
-		"name":        strings.TrimSpace(r.FormValue("name")),
-		"kind":        strings.TrimSpace(r.FormValue("kind")),
-		"repo_url":    strings.TrimSpace(r.FormValue("repo_url")),
-		"password":    r.FormValue("password"),
-		"source_path": strings.TrimSpace(r.FormValue("source_path")),
-		"cadence":     strings.TrimSpace(r.FormValue("cadence_hours")),
-		"sample":      strings.TrimSpace(r.FormValue("sample_size")),
-		"exclude":     r.FormValue("exclude_globs"),
-		"capture_now": r.FormValue("capture_now"),
-	}
-
-	errMsg := validateRepoForm(form)
-	if errMsg == "" {
-		// Probe the repo before we store anything. Fail early on bad creds.
-		adapter, err := restic.NewAdapter(form["repo_url"], form["password"])
-		if err != nil {
-			errMsg = "Restic binary missing in container: " + err.Error()
-		} else if err := adapter.CheckAccess(ctx); err != nil {
-			errMsg = "Could not open restic repo — check URL and password: " + err.Error()
-		}
-	}
-	if errMsg != "" {
-		s.renderPage(w, "New backup repo — RestoreRunner", "repo-new-content", map[string]any{
-			"User":  user,
-			"Error": errMsg,
-			"Form":  form,
-		})
-		return
-	}
-
-	// Encrypt password at rest.
-	mk, err := db.EnsureMasterKey(ctx, s.DB)
+	res, err := s.Orch.Handle(r)
 	if err != nil {
-		http.Error(w, "master key: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	pwEnc, err := db.Encrypt(mk, []byte(form["password"]))
-	if err != nil {
-		http.Error(w, "encrypt: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	cadence := atoiOr(form["cadence"], 168)
-	sample := atoiOr(form["sample"], 30)
-	if cadence < 1 {
-		cadence = 1
-	}
-	if sample < 1 {
-		sample = 1
-	}
-
-	var newID int64
-	row := s.DB.QueryRowContext(ctx, `
-		INSERT INTO repos (name, kind, repo_url, password_enc, source_path,
-		                   sample_size, cadence_hours, exclude_globs,
-		                   enabled, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-		RETURNING id
-	`, form["name"], form["kind"], form["repo_url"], pwEnc, form["source_path"],
-		sample, cadence, form["exclude"], time.Now().Unix())
-	if err := row.Scan(&newID); err != nil {
-		http.Error(w, "insert repo: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Audit.
-	var uid int64
-	if user != nil {
-		uid = user.ID
-	}
-	_, _ = s.DB.ExecContext(ctx, `
-		INSERT INTO actions (repo_id, user_id, action, detail, created_at)
-		VALUES (?, ?, 'enroll', ?, ?)
-	`, newID, uid, form["name"]+" enrolled", time.Now().Unix())
-
-	// Baseline capture — can be long for large sources, fire in a goroutine.
-	if form["capture_now"] == "on" {
-		go func(id int64) {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
-			defer cancel()
-			excludes := strings.Split(form["exclude"], "\n")
-			if err := baseline.Capture(bgCtx, s.DB, id, form["source_path"], excludes, nil); err != nil {
-				s.Logger.Warn("baseline capture", "repo_id", id, "err", err)
-			}
-		}(newID)
-	}
-
-	http.Redirect(w, r, "/?added=1", http.StatusSeeOther)
-}
-
-func validateRepoForm(form map[string]string) string {
-	if form["name"] == "" {
-		return "Name required."
-	}
-	if form["kind"] != "restic" {
-		return "Kind must be 'restic' in v0.1 (Borg and Kopia coming soon)."
-	}
-	if form["repo_url"] == "" {
-		return "Repo URL required."
-	}
-	if form["password"] == "" {
-		return "Password required — paste the restic repo password (we'll store it encrypted)."
-	}
-	if form["source_path"] == "" {
-		return "Source path required — the live directory to compare the backup against."
-	}
-	if !strings.HasPrefix(form["source_path"], "/") {
-		return "Source path must be absolute (start with /)."
-	}
-	// Reject pseudo-filesystems + dangerous roots. Walking these takes
-	// hours, spams kernel logs, and produces a baseline that's useless.
-	for _, bad := range []string{"/proc", "/sys", "/dev", "/run"} {
-		if form["source_path"] == bad || strings.HasPrefix(form["source_path"], bad+"/") {
-			return "Source path cannot be under " + bad + " — that's a kernel pseudo-filesystem, not a real directory."
-		}
-	}
-	if form["source_path"] == "/" {
-		return "Source path cannot be the container root. Mount the real data directory (e.g. /srv/data) and point here."
-	}
-	return ""
-}
-
-// --- /repo/{id} (detail) --------------------------------------------------
-
-type repoDetail struct {
-	ID               int64
-	Name             string
-	Kind             string
-	RepoURL          string
-	SourcePath       string
-	Enabled          bool
-	CadenceHours     int
-	SampleSize       int
-	ExcludeGlobs     string
-	LastRehearsedAt  time.Time
-	LastStatus       string
-	BaselineCaptured time.Time
-	BaselineFiles    int64
-	BaselineBytes    int64
-	BaselineHashable int64
-	Rehearsals       []rehearsalRow
-}
-
-type rehearsalRow struct {
-	ID             int64
-	StartedAt      time.Time
-	FinishedAt     time.Time
-	Status         string
-	SampledCount   int
-	MatchedCount   int
-	DivergedCount  int
-	MissingCount   int
-	LiveFileCount  int64
-	LiveTotalBytes int64
-	StructuralOK   bool
-	Detail         string
-	TriggeredBy    string
-}
-
-func (s *Server) handleRepoDetail(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	idStr := r.PathValue("id")
-	id := atoiOr(idStr, 0)
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-
-	d := repoDetail{ID: int64(id)}
-	var enabled int
-	var lastRehearsed int64
-	err := s.DB.QueryRowContext(r.Context(), `
-		SELECT name, kind, repo_url, source_path, enabled, cadence_hours, sample_size,
-		       COALESCE(exclude_globs, ''), last_rehearsed_at, COALESCE(last_status, '')
-		FROM repos WHERE id = ?
-	`, id).Scan(&d.Name, &d.Kind, &d.RepoURL, &d.SourcePath, &enabled, &d.CadenceHours, &d.SampleSize,
-		&d.ExcludeGlobs, &lastRehearsed, &d.LastStatus)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	d.Enabled = enabled == 1
-	if lastRehearsed > 0 {
-		d.LastRehearsedAt = time.Unix(lastRehearsed, 0)
-	}
-
-	// Baseline metadata (may be absent — empty row).
-	var capturedUnix int64
-	_ = s.DB.QueryRowContext(r.Context(), `
-		SELECT captured_at, file_count, total_bytes, hashable_count
-		FROM baselines WHERE repo_id = ?
-	`, id).Scan(&capturedUnix, &d.BaselineFiles, &d.BaselineBytes, &d.BaselineHashable)
-	if capturedUnix > 0 {
-		d.BaselineCaptured = time.Unix(capturedUnix, 0)
-	}
-
-	// Last 20 rehearsals.
-	rhRows, err := s.DB.QueryContext(r.Context(), `
-		SELECT id, started_at, finished_at, status,
-		       sampled_count, matched_count, diverged_count, missing_count,
-		       live_file_count, live_total_bytes, structural_ok,
-		       detail, COALESCE(triggered_by, '')
-		FROM rehearsals WHERE repo_id = ?
-		ORDER BY started_at DESC LIMIT 20
-	`, id)
-	if err == nil {
-		defer rhRows.Close()
-		for rhRows.Next() {
-			var rh rehearsalRow
-			var startedUnix, finishedUnix int64
-			var structOK int
-			if err := rhRows.Scan(&rh.ID, &startedUnix, &finishedUnix, &rh.Status,
-				&rh.SampledCount, &rh.MatchedCount, &rh.DivergedCount, &rh.MissingCount,
-				&rh.LiveFileCount, &rh.LiveTotalBytes, &structOK,
-				&rh.Detail, &rh.TriggeredBy); err == nil {
-				rh.StartedAt = time.Unix(startedUnix, 0)
-				if finishedUnix > 0 {
-					rh.FinishedAt = time.Unix(finishedUnix, 0)
-				}
-				rh.StructuralOK = structOK == 1
-				d.Rehearsals = append(d.Rehearsals, rh)
-			}
-		}
-	}
-
-	s.renderPage(w, d.Name+" — RestoreRunner", "repo-detail-content", map[string]any{
-		"User":     user,
-		"Repo":     d,
-		"FlashRun": r.URL.Query().Get("ran") == "1",
-		"FlashCap": r.URL.Query().Get("capturing") == "1",
-	})
-}
-
-// --- /repo/{id}/rehearse (Run now) ----------------------------------------
-
-func (s *Server) handleRepoRehearse(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id := int64(atoiOr(idStr, 0))
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	// Verify exists.
-	var dummy int
-	err := s.DB.QueryRowContext(r.Context(), `SELECT 1 FROM repos WHERE id=?`, id).Scan(&dummy)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.NotFound(w, r)
-		return
-	}
-	if s.Scheduler != nil {
-		s.Scheduler.TriggerRepo(id)
-	}
-	http.Redirect(w, r, "/repo/"+idStr+"?ran=1", http.StatusSeeOther)
-}
-
-// --- /repo/{id}/recapture -------------------------------------------------
-
-func (s *Server) handleRepoRecapture(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	idStr := r.PathValue("id")
-	id := int64(atoiOr(idStr, 0))
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	var sourcePath, excludes string
-	err := s.DB.QueryRowContext(ctx, `
-		SELECT source_path, COALESCE(exclude_globs, '') FROM repos WHERE id=?
-	`, id).Scan(&sourcePath, &excludes)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.NotFound(w, r)
-		return
-	}
-	// Baseline capture can take hours; background it.
-	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
-		defer cancel()
-		list := strings.Split(excludes, "\n")
-		if err := baseline.Capture(bgCtx, s.DB, id, sourcePath, list, nil); err != nil {
-			s.Logger.Warn("recapture baseline", "repo_id", id, "err", err)
-		}
-	}()
-	http.Redirect(w, r, "/repo/"+idStr+"?capturing=1", http.StatusSeeOther)
-}
-
-// --- /repo/{id}/toggle (enable/disable) -----------------------------------
-
-func (s *Server) handleRepoToggle(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id := int64(atoiOr(idStr, 0))
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	_, err := s.DB.ExecContext(r.Context(),
-		`UPDATE repos SET enabled = CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?`, id)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, "/repo/"+idStr, http.StatusSeeOther)
-}
-
-// --- /repo/{id}/delete ----------------------------------------------------
-
-func (s *Server) handleRepoDelete(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id := int64(atoiOr(idStr, 0))
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	_ = r.ParseForm()
-	// Confirmation: user must re-type the repo name.
-	confirm := strings.TrimSpace(r.FormValue("confirm_name"))
-	var name string
-	err := s.DB.QueryRowContext(r.Context(), `SELECT name FROM repos WHERE id=?`, id).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.NotFound(w, r)
-		return
-	}
-	if confirm != name {
-		http.Error(w, "confirm name does not match — refusing delete", http.StatusBadRequest)
-		return
-	}
-	if _, err := s.DB.ExecContext(r.Context(), `DELETE FROM repos WHERE id=?`, id); err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-// --- /settings ------------------------------------------------------------
-
-type settingsForm struct {
-	DefaultCadenceHours int
-	DefaultSampleSize   int
-	AppriseURLs         []string
-	NotifyOnFail        bool
-	NotifyOnDegraded    bool
-	NotifyOnPass        bool
-	ScratchDir          string
-}
-
-func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	form := s.loadSettings(r.Context())
-	s.renderPage(w, "Settings — RestoreRunner", "settings-content", map[string]any{
-		"User":     user,
-		"Settings": form,
-		"Saved":    r.URL.Query().Get("saved") == "1",
-	})
-}
-
-func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	_ = r.ParseForm()
-
-	_ = db.SettingSet(ctx, s.DB, db.KeyDefaultCadenceHours, strings.TrimSpace(r.FormValue("default_cadence_hours")))
-	_ = db.SettingSet(ctx, s.DB, db.KeyDefaultSampleSize, strings.TrimSpace(r.FormValue("default_sample_size")))
-	_ = db.SettingSet(ctx, s.DB, db.KeyScratchDir, strings.TrimSpace(r.FormValue("scratch_dir")))
-	_ = db.SettingSet(ctx, s.DB, db.KeyNotifyOnFail, boolForm(r.FormValue("notify_on_fail")))
-	_ = db.SettingSet(ctx, s.DB, db.KeyNotifyOnDegraded, boolForm(r.FormValue("notify_on_degraded")))
-	_ = db.SettingSet(ctx, s.DB, db.KeyNotifyOnPass, boolForm(r.FormValue("notify_on_pass")))
-
-	urls := splitLines(r.FormValue("apprise_urls"))
-	_ = db.SettingSetJSON(ctx, s.DB, db.KeyAppriseURLs, urls)
-
-	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
-}
-
-func (s *Server) loadSettings(ctx context.Context) settingsForm {
-	var form settingsForm
-	form.DefaultCadenceHours = db.SettingGetInt(ctx, s.DB, db.KeyDefaultCadenceHours, 168)
-	form.DefaultSampleSize = db.SettingGetInt(ctx, s.DB, db.KeyDefaultSampleSize, 30)
-	form.NotifyOnFail = db.SettingGetBool(ctx, s.DB, db.KeyNotifyOnFail, true)
-	form.NotifyOnDegraded = db.SettingGetBool(ctx, s.DB, db.KeyNotifyOnDegraded, true)
-	form.NotifyOnPass = db.SettingGetBool(ctx, s.DB, db.KeyNotifyOnPass, false)
-	form.ScratchDir, _ = db.SettingGet(ctx, s.DB, db.KeyScratchDir)
-	_ = db.SettingGetJSON(ctx, s.DB, db.KeyAppriseURLs, &form.AppriseURLs)
-	return form
-}
-
-// --- CSV exports ----------------------------------------------------------
-
-var rehearsalCSVColumns = []string{
-	"repo_name", "repo_kind", "repo_url", "source_path",
-	"started_at", "finished_at", "status",
-	"sampled_count", "matched_count", "diverged_count", "missing_count",
-	"live_file_count", "live_total_bytes", "structural_ok",
-	"detail", "triggered_by",
-}
-
-func (s *Server) handleFleetRehearsalExport(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.DB.QueryContext(r.Context(), `
-		SELECT r.name, r.kind, r.repo_url, r.source_path,
-		       rh.started_at, rh.finished_at, rh.status,
-		       rh.sampled_count, rh.matched_count, rh.diverged_count, rh.missing_count,
-		       rh.live_file_count, rh.live_total_bytes, rh.structural_ok,
-		       rh.detail, COALESCE(rh.triggered_by, '')
-		FROM rehearsals rh JOIN repos r ON r.id = rh.repo_id
-		ORDER BY r.name, rh.started_at DESC`)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-	s.writeRehearsalCSV(w, "fleet.restore-runner-export."+time.Now().Format("2006-01-02")+".csv", rows)
-}
-
-func (s *Server) handleRepoRehearsalExport(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiOr(r.PathValue("id"), 0))
-	if id == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	var name string
-	err := s.DB.QueryRowContext(r.Context(), `SELECT name FROM repos WHERE id=?`, id).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	rows, err := s.DB.QueryContext(r.Context(), `
-		SELECT r.name, r.kind, r.repo_url, r.source_path,
-		       rh.started_at, rh.finished_at, rh.status,
-		       rh.sampled_count, rh.matched_count, rh.diverged_count, rh.missing_count,
-		       rh.live_file_count, rh.live_total_bytes, rh.structural_ok,
-		       rh.detail, COALESCE(rh.triggered_by, '')
-		FROM rehearsals rh JOIN repos r ON r.id = rh.repo_id
-		WHERE rh.repo_id = ?
-		ORDER BY rh.started_at DESC`, id)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-	s.writeRehearsalCSV(w,
-		sanitiseFilenamePart(name)+".restore-runner-export."+time.Now().Format("2006-01-02")+".csv",
-		rows)
-}
-
-func (s *Server) writeRehearsalCSV(w http.ResponseWriter, filename string, rows *sql.Rows) {
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
-	w.Header().Set("Cache-Control", "no-store")
-
-	cw := csv.NewWriter(w)
-	_ = cw.Write(rehearsalCSVColumns)
-
-	for rows.Next() {
-		var (
-			name, kind, repoURL, source, status, detail, triggeredBy string
-			startedUnix, finishedUnix                                int64
-			sampled, matched, diverged, missing                      int
-			liveFiles, liveBytes                                     int64
-			structOK                                                 int
-		)
-		if err := rows.Scan(&name, &kind, &repoURL, &source,
-			&startedUnix, &finishedUnix, &status,
-			&sampled, &matched, &diverged, &missing,
-			&liveFiles, &liveBytes, &structOK,
-			&detail, &triggeredBy); err != nil {
-			continue
-		}
-		started := time.Unix(startedUnix, 0).UTC().Format(time.RFC3339)
-		finished := ""
-		if finishedUnix > 0 {
-			finished = time.Unix(finishedUnix, 0).UTC().Format(time.RFC3339)
-		}
-		structStr := "true"
-		if structOK == 0 {
-			structStr = "false"
-		}
-		_ = cw.Write([]string{
-			name, kind, repoURL, source,
-			started, finished, status,
-			itoa(sampled), itoa(matched), itoa(diverged), itoa(missing),
-			itoa64(liveFiles), itoa64(liveBytes), structStr,
-			detail, triggeredBy,
-		})
-		cw.Flush()
-		if err := cw.Error(); err != nil {
-			s.Logger.Warn("csv export write failed", "err", err)
+		if errors.Is(err, upload.ErrNoXML) {
+			// The run row was already created + marked failed; surface a
+			// friendly page that links to the run detail so the user can
+			// delete it or see the error.
+			http.Redirect(w, r, "/?err="+urlEncode("Archive didn't contain an Unraid container XML template. Nothing to boot."), http.StatusSeeOther)
 			return
 		}
+		s.Logger.Warn("upload failed", "err", err)
+		http.Redirect(w, r, "/?err="+urlEncode("Upload failed: "+err.Error()), http.StatusSeeOther)
+		return
 	}
-	cw.Flush()
+	// Route by template count.
+	switch len(res.Templates) {
+	case 1:
+		// Auto-start in the background; redirect to run detail immediately
+		// so the user sees logs streaming as docker pulls.
+		go s.startRun(detachedContext(), res.RunID, res.Templates[0], res.ExtractDir)
+		http.Redirect(w, r, "/run/"+res.RunID, http.StatusSeeOther)
+	default:
+		// >1 templates → picker page.
+		http.Redirect(w, r, "/picker/"+res.RunID, http.StatusSeeOther)
+	}
+}
+
+// --- /picker/{id} ---------------------------------------------------------
+
+func (s *Server) handlePickerGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	extractDir := s.Orch.ExtractDir(id)
+	tpls, err := unraidxml.FindTemplates(extractDir)
+	if err != nil || len(tpls) == 0 {
+		http.Redirect(w, r, "/?err="+urlEncode("No templates found to pick from."), http.StatusSeeOther)
+		return
+	}
+	// Each option's value is the XML path relative to the extract dir.
+	type opt struct {
+		RelPath    string
+		Name       string
+		Repository string
+	}
+	var options []opt
+	for _, t := range tpls {
+		rel, _ := filepath.Rel(extractDir, t.Path)
+		options = append(options, opt{RelPath: rel, Name: t.Name, Repository: t.Repository})
+	}
+	s.renderPage(w, "Pick a template — RestoreRunner", "picker-content", map[string]any{
+		"User":    auth.UserFromContext(r.Context()),
+		"Run":     run,
+		"Options": options,
+	})
+}
+
+func (s *Server) handlePickerPost(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	rel := r.FormValue("xml")
+	if rel == "" {
+		http.Redirect(w, r, "/picker/"+id, http.StatusSeeOther)
+		return
+	}
+	extractDir := s.Orch.ExtractDir(id)
+	// Resolve + validate the chosen path is inside the extract dir.
+	abs, err := safeExtractPath(extractDir, rel)
+	if err != nil {
+		http.Error(w, "bad path", http.StatusBadRequest)
+		return
+	}
+	tpl, err := unraidxml.Parse(abs)
+	if err != nil {
+		http.Error(w, "template parse: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	relXML, _ := filepath.Rel(extractDir, abs)
+	if err := db.UpdateRunExtracted(r.Context(), s.DB, id, relXML, tpl.Repository); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	go s.startRun(detachedContext(), id, tpl, extractDir)
+	http.Redirect(w, r, "/run/"+id, http.StatusSeeOther)
+}
+
+// safeExtractPath ensures the user-supplied relative path stays inside
+// extractDir both lexically AND after symlink resolution. RAR is
+// extracted via 7z which may preserve symlinks the archive contained;
+// if one of those ever pointed out of extractDir, Parse() on the
+// resolved path would read arbitrary host files. EvalSymlinks blocks
+// that.
+func safeExtractPath(extractDir, rel string) (string, error) {
+	if rel == "" || filepath.IsAbs(rel) || strings.Contains(rel, "..") {
+		return "", errors.New("unsafe path")
+	}
+	abs := filepath.Join(extractDir, rel)
+	abs, err := filepath.Abs(abs)
+	if err != nil {
+		return "", err
+	}
+	absExtract, err := filepath.Abs(extractDir)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(abs+string(os.PathSeparator), absExtract+string(os.PathSeparator)) {
+		return "", errors.New("path escapes extract dir")
+	}
+	// Defence-in-depth: resolve any symlinks and check we still live
+	// inside the extract dir.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		absResolved, _ := filepath.Abs(resolved)
+		if !strings.HasPrefix(absResolved+string(os.PathSeparator), absExtract+string(os.PathSeparator)) {
+			return "", errors.New("symlink target escapes extract dir")
+		}
+	}
+	return abs, nil
+}
+
+// --- run orchestration ----------------------------------------------------
+
+// startRun pulls the image, starts the container, persists logs to disk,
+// and schedules the auto-stop timeout. Runs in its own goroutine.
+func (s *Server) startRun(ctx context.Context, runID string, tpl *unraidxml.Template, extractDir string) {
+	opts := sandbox.RunOpts{
+		ContainerName: "rr-" + runID,
+		Template:      tpl,
+		ExtractedDir:  extractDir,
+		MemoryBytes:   s.MemoryBytes,
+		CPUs:          s.CPUs,
+	}
+	startCtx, cancel := context.WithTimeout(ctx, 6*time.Minute) // covers image pull
+	defer cancel()
+	res, err := s.Sandbox.Run(startCtx, opts)
+	if err != nil {
+		s.Logger.Warn("run failed", "id", runID, "err", err)
+		_ = db.UpdateRunFailed(context.Background(), s.DB, runID,
+			friendlyDockerError(err))
+		return
+	}
+	webui := unraidxml.ResolveWebUI(tpl.WebUI, "<host>", res.HostPort)
+	if err := db.UpdateRunRunning(context.Background(), s.DB, runID,
+		res.ContainerID, res.ContainerName, res.HostPort, webui); err != nil {
+		s.Logger.Warn("mark running", "id", runID, "err", err)
+	}
+
+	// Start log persister. Reads from the live log stream and tees to
+	// the on-disk log file. SSE endpoint can tail the file after the
+	// container exits.
+	go s.persistLogs(runID, res.ContainerID)
+
+	// Schedule auto-stop.
+	if s.RunTimeout > 0 {
+		go func() {
+			time.Sleep(s.RunTimeout)
+			// Only stop if it's still marked running — user may have
+			// stopped it manually already.
+			if run, err := db.GetRun(context.Background(), s.DB, runID); err == nil && run.Status == "running" {
+				s.Logger.Info("auto-stop timeout", "id", runID)
+				_ = s.Sandbox.Stop(context.Background(), res.ContainerID)
+				_ = db.UpdateRunStopped(context.Background(), s.DB, runID)
+			}
+		}()
+	}
+}
+
+// persistLogs opens the container's log stream and writes it to the
+// run's logs.txt. The file is append-mode so relaunch appends a new
+// session. SSE readers will read from this file.
+func (s *Server) persistLogs(runID, containerID string) {
+	logPath := s.Orch.LogPath(runID)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		s.Logger.Warn("open log file", "err", err)
+		return
+	}
+	defer f.Close()
+
+	rc, err := s.Sandbox.Logs(context.Background(), containerID)
+	if err != nil {
+		_, _ = fmt.Fprintf(f, "\n[restore-runner] log stream error: %v\n", err)
+		return
+	}
+	defer rc.Close()
+
+	// Header so it's clear this is a new session in append-mode files.
+	_, _ = fmt.Fprintf(f, "\n[restore-runner] session start %s container=%s\n",
+		time.Now().UTC().Format(time.RFC3339), containerID[:12])
+	_, _ = io.Copy(f, rc)
+	_, _ = fmt.Fprintf(f, "\n[restore-runner] session end %s\n",
+		time.Now().UTC().Format(time.RFC3339))
+}
+
+// friendlyDockerError turns a raw docker error into something a user can
+// act on. We match common cases only; fallback is the raw error text.
+func friendlyDockerError(err error) string {
+	s := err.Error()
+	low := strings.ToLower(s)
+	switch {
+	case strings.Contains(low, "docker.sock") || strings.Contains(low, "no such file") && strings.Contains(low, "socket"):
+		return "Docker socket not mounted — add `-v /var/run/docker.sock:/var/run/docker.sock` to your compose."
+	case strings.Contains(low, "permission denied") && strings.Contains(low, "sock"):
+		return "Docker socket mount is not writable — check the socket permissions on the host."
+	case strings.Contains(low, "manifest unknown") || strings.Contains(low, "not found") && strings.Contains(low, "manifest"):
+		return "Image not found on its registry — the XML's <Repository> may be wrong or the tag was removed upstream."
+	case strings.Contains(low, "no route to host") || strings.Contains(low, "dial tcp") || strings.Contains(low, "timeout"):
+		return "Couldn't reach the image registry — check the host's internet connection."
+	}
+	return s
+}
+
+// --- /run/{id} (detail) ---------------------------------------------------
+
+func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, "Run "+run.OriginalName+" — RestoreRunner", "run-detail-content",
+		map[string]any{
+			"User": auth.UserFromContext(r.Context()),
+			"Run":  run,
+		})
+}
+
+// --- /run/{id}/logs (SSE) ------------------------------------------------
+
+// handleRunLogs streams the log file + live tail via Server-Sent Events.
+// Strategy:
+//   1. Open logs.txt; send everything we have so far.
+//   2. Keep reading; when we reach EOF, poll every ~500ms for new bytes.
+//   3. Exit when the client disconnects OR the run leaves "running" and
+//      we've drained the file.
+func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	logPath := s.Orch.LogPath(id)
+	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+		flusher.Flush()
+		return
+	}
+	defer f.Close()
+
+	// Hard cap on how long an SSE session can hold a goroutine open so
+	// a stuck/walking-away client can't leak indefinitely.
+	const sessionLimit = 2 * time.Hour
+	deadline := time.Now().Add(sessionLimit)
+
+	buf := make([]byte, 8192)
+	for {
+		if time.Now().After(deadline) {
+			fmt.Fprintf(w, "event: end\ndata: session expired\n\n")
+			flusher.Flush()
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+		n, err := f.Read(buf)
+		if n > 0 {
+			// Escape newlines per SSE framing: one "data: " line per
+			// physical line so the client gets a clean stream.
+			for _, line := range splitLines(buf[:n]) {
+				fmt.Fprintf(w, "data: %s\n\n", line)
+			}
+			flusher.Flush()
+			continue
+		}
+		if err != nil && err != io.EOF {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			flusher.Flush()
+			return
+		}
+		// EOF — check whether the run is still running. If not and we've
+		// drained, close the stream.
+		latest, _ := db.GetRun(r.Context(), s.DB, id)
+		if latest != nil && latest.Status != "running" && latest.Status != "extracted" && latest.Status != "pending" {
+			fmt.Fprintf(w, "event: end\ndata: %s\n\n", latest.Status)
+			flusher.Flush()
+			_ = run // keep run var used for templates elsewhere
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// splitLines returns SSE-safe chunks. Each input newline maps to a
+// separate data event; embedded carriage returns are dropped.
+func splitLines(b []byte) []string {
+	s := strings.ReplaceAll(string(b), "\r", "")
+	// Preserve empty-line breaks so log formatting survives.
+	parts := strings.Split(s, "\n")
+	return parts
+}
+
+// --- /run/{id}/stop -------------------------------------------------------
+
+func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if run.ContainerID != "" {
+		if err := s.Sandbox.Stop(r.Context(), run.ContainerID); err != nil {
+			s.Logger.Warn("stop failed", "id", id, "err", err)
+		}
+	}
+	_ = db.UpdateRunStopped(r.Context(), s.DB, id)
+	http.Redirect(w, r, "/run/"+id, http.StatusSeeOther)
+}
+
+// --- /run/{id}/relaunch ---------------------------------------------------
+
+// handleRunRelaunch re-runs a previously-extracted archive without asking
+// the user to re-upload. Stops any currently-running container first.
+func (s *Server) handleRunRelaunch(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	extractDir := s.Orch.ExtractDir(id)
+	if run.XMLPath == "" {
+		http.Error(w, "no XML recorded for this run", http.StatusBadRequest)
+		return
+	}
+	abs, err := safeExtractPath(extractDir, run.XMLPath)
+	if err != nil {
+		http.Error(w, "bad xml path", http.StatusBadRequest)
+		return
+	}
+	tpl, err := unraidxml.Parse(abs)
+	if err != nil {
+		http.Error(w, "parse xml: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Tear down any prior container.
+	if run.ContainerID != "" {
+		_ = s.Sandbox.Stop(r.Context(), run.ContainerID)
+	}
+	go s.startRun(detachedContext(), id, tpl, extractDir)
+	http.Redirect(w, r, "/run/"+id, http.StatusSeeOther)
+}
+
+// --- /run/{id}/delete -----------------------------------------------------
+
+func (s *Server) handleRunDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := db.GetRun(r.Context(), s.DB, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if run.ContainerID != "" && run.Status == "running" {
+		_ = s.Sandbox.Stop(r.Context(), run.ContainerID)
+	}
+	_ = s.Orch.DeleteRunFiles(id)
+	_ = db.DeleteRun(r.Context(), s.DB, id)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // --- helpers --------------------------------------------------------------
 
-// renderPage renders the named body template inside the layout shell.
 func (s *Server) renderPage(w http.ResponseWriter, title, bodyTemplate string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
 	}
 	data["Title"] = title
 	data["Body"] = bodyTemplate
-	// Preserve User if caller supplied it.
+	if _, hasUser := data["User"]; !hasUser {
+		data["User"] = nil
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tpl.ExecuteTemplate(w, "layout", data); err != nil {
-		s.Logger.Warn("render template", "tpl", bodyTemplate, "err", err)
+		s.Logger.Error("render", "body", bodyTemplate, "err", err)
 	}
 }
 
-func atoiOr(s string, fallback int) int {
-	if s == "" {
-		return fallback
-	}
-	n := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return fallback
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
-}
-
-func itoa64(n int64) string {
-	return itoa(int(n))
-}
-
-func boolForm(v string) string {
-	switch v {
-	case "on", "true", "1", "yes":
-		return "true"
-	}
-	return "false"
-}
-
-func splitLines(s string) []string {
-	out := []string{}
-	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-// sanitiseFilenamePart makes a string safe for Content-Disposition.
-func sanitiseFilenamePart(s string) string {
-	if s == "" {
-		return "repo"
-	}
-	out := make([]byte, 0, len(s))
+// urlEncode: minimal query-string escaper (we only use it for flash
+// messages which we control).
+func urlEncode(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 16)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-			out = append(out, c)
-		case c == '.' || c == '-' || c == '_':
-			out = append(out, c)
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.', c == '~':
+			b.WriteByte(c)
+		case c == ' ':
+			b.WriteByte('+')
 		default:
-			out = append(out, '-')
+			b.WriteString("%" + strconv.FormatInt(int64(c), 16))
 		}
 	}
-	return string(out)
+	return b.String()
 }
-
-// keep the html/template import used (used by renderBody in server.go)
-var _ = template.HTML("")

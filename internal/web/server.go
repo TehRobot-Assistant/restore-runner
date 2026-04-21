@@ -1,15 +1,26 @@
-// Package web serves RestoreRunner's HTTP UI. Flows:
+// Package web serves RestoreRunner's HTTP UI.
 //
-//  1. First-run /setup wizard — collects admin username + password.
-//  2. /login — session cookie issuer.
-//  3. Everything else — dashboard, repo detail, add-repo wizard, settings.
-//     Gated by the auth middleware.
-//
-// All configuration lives in SQLite settings + repos tables; no YAML.
+// Routes:
+//   GET  /health          — unauth, container healthcheck
+//   GET  /setup           — first-run admin wizard (when no users exist)
+//   POST /setup           — creates the admin + auto-logs-in
+//   GET  /login           — login form
+//   POST /login           — issues session cookie
+//   POST /logout          — clears session
+//   GET  /                — dashboard: drop-zone + past runs list
+//   POST /upload          — multipart archive upload entrypoint
+//   GET  /picker/{id}     — template picker when archive had >1 XML
+//   POST /picker/{id}     — user's chosen XML; triggers the docker run
+//   GET  /run/{id}        — single-run detail page (status + live logs)
+//   GET  /run/{id}/logs   — SSE stream of live + persisted logs
+//   POST /run/{id}/stop   — stops + removes the container
+//   POST /run/{id}/relaunch — re-runs the already-extracted archive
+//   POST /run/{id}/delete — removes the run (container first if running)
 package web
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"embed"
 	"html/template"
@@ -17,26 +28,37 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/trstudios/restore-runner/internal/auth"
-	"github.com/trstudios/restore-runner/internal/scheduler"
+	"github.com/trstudios/restore-runner/internal/sandbox"
+	"github.com/trstudios/restore-runner/internal/upload"
 )
 
 //go:embed templates/*.html static/*
 var assets embed.FS
 
-// Server holds dependencies for every handler.
+// Server holds every dependency the handlers need.
 type Server struct {
-	DB        *sql.DB
-	Logger    *slog.Logger
-	Scheduler *scheduler.Scheduler
+	DB             *sql.DB
+	Logger         *slog.Logger
+	Sandbox        *sandbox.Client
+	Orch           *upload.Orchestrator
+	RunTimeout     time.Duration // auto-stop after this long
+	MemoryBytes    int64
+	CPUs           float64
+	MaxUploadBytes int64
 
 	tpl *template.Template
 }
 
-// NewServer wires templates.
-func NewServer(db *sql.DB, logger *slog.Logger, sch *scheduler.Scheduler) (*Server, error) {
+// NewServer wires templates + helpers.
+func NewServer(
+	db *sql.DB, logger *slog.Logger,
+	sb *sandbox.Client, orch *upload.Orchestrator,
+	runTimeout time.Duration, memBytes int64, cpus float64, maxUpload int64,
+) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -55,75 +77,53 @@ func NewServer(db *sql.DB, logger *slog.Logger, sch *scheduler.Scheduler) (*Serv
 	tpl = template.New("").Funcs(template.FuncMap{
 		"fmtTime":    fmtTime,
 		"agoT":       agoT,
-		"upper":      upper,
-		"humanBytes": humanBytes,
+		"fmtSize":    fmtSize,
 		"renderBody": renderBody,
 	})
 	tpl, err = tpl.ParseFS(tplFS, "*.html")
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DB: db, Logger: logger, Scheduler: sch, tpl: tpl}, nil
+	return &Server{
+		DB: db, Logger: logger, Sandbox: sb, Orch: orch,
+		RunTimeout:     runTimeout,
+		MemoryBytes:    memBytes,
+		CPUs:           cpus,
+		MaxUploadBytes: maxUpload,
+		tpl:            tpl,
+	}, nil
 }
 
-// Handler returns the mux with auth middleware.
+// Handler returns the fully-configured http.Handler (mux + middleware).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Public.
 	mux.HandleFunc("GET /setup", s.handleSetupGet)
 	mux.HandleFunc("POST /setup", s.handleSetupPost)
 	mux.HandleFunc("GET /login", s.handleLoginGet)
 	mux.HandleFunc("POST /login", s.handleLoginPost)
 	mux.HandleFunc("GET /health", s.handleHealth)
 
-	// Authenticated.
 	mux.HandleFunc("GET /{$}", s.handleDashboard)
-	mux.HandleFunc("GET /repos/new", s.handleRepoNewGet)
-	mux.HandleFunc("POST /repos/new", s.handleRepoNewPost)
-	mux.HandleFunc("GET /repo/{id}", s.handleRepoDetail)
-	mux.HandleFunc("POST /repo/{id}/rehearse", s.handleRepoRehearse)
-	mux.HandleFunc("POST /repo/{id}/recapture", s.handleRepoRecapture)
-	mux.HandleFunc("POST /repo/{id}/toggle", s.handleRepoToggle)
-	mux.HandleFunc("POST /repo/{id}/delete", s.handleRepoDelete)
-	mux.HandleFunc("GET /repo/{id}/rehearsals.csv", s.handleRepoRehearsalExport)
-	mux.HandleFunc("GET /export/rehearsals.csv", s.handleFleetRehearsalExport)
+	mux.HandleFunc("POST /upload", s.handleUpload)
+	mux.HandleFunc("GET /picker/{id}", s.handlePickerGet)
+	mux.HandleFunc("POST /picker/{id}", s.handlePickerPost)
+	mux.HandleFunc("GET /run/{id}", s.handleRunDetail)
+	mux.HandleFunc("GET /run/{id}/logs", s.handleRunLogs)
+	mux.HandleFunc("POST /run/{id}/stop", s.handleRunStop)
+	mux.HandleFunc("POST /run/{id}/relaunch", s.handleRunRelaunch)
+	mux.HandleFunc("POST /run/{id}/delete", s.handleRunDelete)
 	mux.HandleFunc("POST /logout", s.handleLogout)
-	mux.HandleFunc("GET /settings", s.handleSettingsGet)
-	mux.HandleFunc("POST /settings", s.handleSettingsPost)
 
-	// Static assets.
 	staticFS, _ := fs.Sub(assets, "static")
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 
 	return auth.Middleware(s.DB, mux)
 }
 
-// Listen binds 0.0.0.0:port.
+// Listen returns a listener bound to 0.0.0.0:port.
 func (s *Server) Listen(port int) (net.Listener, error) {
-	return net.Listen("tcp", ":"+itoa(port))
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [16]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
+	return net.Listen("tcp", ":"+strconv.Itoa(port))
 }
 
 // --- template helpers -----------------------------------------------------
@@ -144,44 +144,29 @@ func agoT(t time.Time) string {
 	case d < time.Minute:
 		return "just now"
 	case d < time.Hour:
-		return itoa(int(d.Minutes())) + "m ago"
+		return strconv.Itoa(int(d.Minutes())) + "m ago"
 	case d < 48*time.Hour:
-		return itoa(int(d.Hours())) + "h ago"
+		return strconv.Itoa(int(d.Hours())) + "h ago"
 	default:
-		return itoa(int(d.Hours())/24) + "d ago"
+		return strconv.Itoa(int(d.Hours())/24) + "d ago"
 	}
 }
 
-func upper(s string) string {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 32
-		}
-		out[i] = c
+func fmtSize(n int64) string {
+	const k = 1024
+	if n < k {
+		return strconv.FormatInt(n, 10) + " B"
 	}
-	return string(out)
+	if n < k*k {
+		return strconv.FormatFloat(float64(n)/k, 'f', 1, 64) + " KiB"
+	}
+	if n < k*k*k {
+		return strconv.FormatFloat(float64(n)/(k*k), 'f', 1, 64) + " MiB"
+	}
+	return strconv.FormatFloat(float64(n)/(k*k*k), 'f', 2, 64) + " GiB"
 }
 
-// humanBytes formats a size like 1.2GB / 850KB.
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return itoa(int(n)) + "B"
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	val := float64(n) / float64(div)
-	// one-decimal formatter without fmt.Sprintf dep creep
-	suffix := "KMGTPE"[exp]
-	whole := int(val)
-	tenths := int((val - float64(whole)) * 10)
-	if tenths == 0 {
-		return itoa(whole) + string(suffix) + "B"
-	}
-	return itoa(whole) + "." + itoa(tenths) + string(suffix) + "B"
-}
+// Used by package-internal callers that need the background ctx that
+// survives the request lifetime (e.g. long docker runs triggered by a
+// form submit).
+func detachedContext() context.Context { return context.Background() }

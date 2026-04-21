@@ -1,0 +1,60 @@
+{{define "run-detail-content"}}
+<div class="page-head">
+  <h1>{{.Run.OriginalName}}</h1>
+  {{if eq .Run.Status "running"}}<span class="chip chip-ok">running</span>
+  {{else if eq .Run.Status "stopped"}}<span class="chip chip-muted">stopped</span>
+  {{else if eq .Run.Status "failed"}}<span class="chip chip-danger">failed</span>
+  {{else if eq .Run.Status "extracted"}}<span class="chip chip-warn">extracted</span>
+  {{else}}<span class="chip chip-muted">{{.Run.Status}}</span>{{end}}
+</div>
+
+{{if .Run.Error}}<div class="error">{{.Run.Error}}</div>{{end}}
+
+<table class="kv">
+  <tr><th>Run ID</th><td><code>{{.Run.ID}}</code></td></tr>
+  <tr><th>Uploaded</th><td>{{fmtTime .Run.UploadedAt}} ({{agoT .Run.UploadedAt}})</td></tr>
+  <tr><th>Size</th><td>{{fmtSize .Run.SizeBytes}}</td></tr>
+  <tr><th>Image</th><td><code>{{.Run.Image}}</code></td></tr>
+  {{if .Run.HostPort}}<tr><th>Host port</th><td><code>{{.Run.HostPort}}</code></td></tr>{{end}}
+  {{if .Run.WebUIURL}}<tr><th>WebUI template</th><td><code>{{.Run.WebUIURL}}</code></td></tr>{{end}}
+  {{if .Run.ContainerName}}<tr><th>Container</th><td><code>{{.Run.ContainerName}}</code></td></tr>{{end}}
+</table>
+
+<div class="actions">
+  {{if eq .Run.Status "running"}}
+  <form method="post" action="/run/{{.Run.ID}}/stop" style="display:inline">
+    <button type="submit" class="secondary">Stop container</button>
+  </form>
+  {{end}}
+  {{if or (eq .Run.Status "stopped") (eq .Run.Status "failed")}}
+  {{if .Run.XMLPath}}
+  <form method="post" action="/run/{{.Run.ID}}/relaunch" style="display:inline">
+    <button type="submit">Relaunch</button>
+  </form>
+  {{end}}
+  {{end}}
+  <form method="post" action="/run/{{.Run.ID}}/delete" style="display:inline"
+        onsubmit="return confirm('Delete this run and its extracted files?')">
+    <button type="submit" class="secondary">Delete</button>
+  </form>
+</div>
+
+<h2>Logs</h2>
+<pre id="logs" class="update-output" data-run-id="{{.Run.ID}}"
+     data-status="{{.Run.Status}}"></pre>
+
+<script>
+(function(){
+  var pre = document.getElementById('logs');
+  if (!pre) return;
+  var id = pre.dataset.runId;
+  var es = new EventSource('/run/' + id + '/logs');
+  es.onmessage = function(ev){
+    pre.textContent += ev.data + '\n';
+    pre.scrollTop = pre.scrollHeight;
+  };
+  es.addEventListener('end', function(){ es.close(); });
+  es.onerror = function(){ /* reconnection handled by browser */ };
+})();
+</script>
+{{end}}

@@ -187,12 +187,6 @@ table.kv tr { border: 0; }
 .page-head form.inline { margin: 0; }
 .last-checked { padding-left: .25rem; }
 
-/* Key/value description list used on the repo detail page. */
-dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0; }
-dl.kv dt { color: var(--muted); }
-dl.kv dd { margin: 0; }
-.card.danger { border: 1px dashed var(--err); }
-
 /* Sortable-table affordance: header text looks clickable + shows direction
    when sorted. Purely visual; behaviour lives in dashboard.js. */
 table.sortable th.sort-clickable { cursor: pointer; user-select: none; }
@@ -229,3 +223,43 @@ button.secondary:hover, a.secondary.button:hover { border-color: var(--accent); 
   max-height: 24rem;
   overflow: auto;
 }
+
+/* --- RestoreRunner additions --- */
+
+/* Drop-zone for archive uploads */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  min-height: 10rem;
+  padding: 2rem;
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+.dropzone input[type=file] {
+  position: absolute;
+  width: 1px; height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.dropzone-hint { color: var(--text); }
+.dropzone-filename { min-height: 1em; }
+
+/* Runs table */
+table.runs th:nth-child(4), table.runs td:nth-child(4) { text-align: center; width: 7rem; }
+table.runs th:last-child, table.runs td:last-child { text-align: right; width: 5rem; }
+
+.stack-row { display: flex; gap: .75rem; align-items: flex-start; padding: .6rem .8rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.stack-row input[type=radio] { margin-top: .35rem; }
+
+.actions { margin: 1rem 0; display: flex; gap: .5rem; flex-wrap: wrap; }

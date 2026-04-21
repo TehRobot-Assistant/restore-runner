@@ -1,77 +1,53 @@
 {{define "dashboard-content"}}
 <div class="page-head">
-  <h1>Backup repos</h1>
-  <a class="secondary button" href="/repos/new">+ Add repo</a>
-  <a class="secondary button" href="/export/rehearsals.csv" download>Export rehearsals (CSV)</a>
-  <span class="last-checked muted small"
-        {{if .LastRehearsalUnix}}data-last-checked-unix="{{.LastRehearsalUnix}}"{{end}}>
-    {{if .LastRehearsal.IsZero}}
-      Last rehearsal: never
-    {{else}}
-      Last rehearsal: <span class="js-last-checked">{{agoT .LastRehearsal}}</span>
-    {{end}}
-  </span>
+  <h1>Restore a backup</h1>
 </div>
 
-{{if .FlashAdded}}
-<div class="ok">Repo added. Baseline capture may still be running — check the repo page in a minute.</div>
-{{end}}
-{{if .FlashRehearsing}}
-<div class="ok">Rehearsal triggered.</div>
-{{end}}
+{{if .FlashErr}}<div class="error">{{.FlashErr}}</div>{{end}}
+{{if .Flash}}<div class="ok">{{.Flash}}</div>{{end}}
 
-{{if .FirstRun}}
-<div class="hint">
-  <strong>No repos yet.</strong> Add a restic backup repository to get started —
-  RestoreRunner captures a baseline of your source files, then periodically pulls
-  a random sample from the backup and hashes it against that baseline to prove
-  the backup is still restorable.
-  <p><a class="secondary button" href="/repos/new">Add your first repo</a></p>
-</div>
-{{else}}
-<table class="containers sortable">
+<form id="upload-form" method="post" action="/upload" enctype="multipart/form-data" class="stack">
+  <label class="dropzone" id="dropzone">
+    <input type="file" name="archive" id="archive-input"
+           accept=".zip,.rar,.tar,.tar.gz,.tgz,.tar.zst" required>
+    <span class="dropzone-hint">
+      <strong>Drop a backup archive here</strong><br>
+      <span class="muted small">or click to choose a file — .zip, .rar, .tar, .tar.gz, .tar.zst
+      {{if .MaxUploadMiB}} · up to {{.MaxUploadMiB}} MiB{{end}}</span>
+    </span>
+    <span class="dropzone-filename muted small" id="dropzone-filename"></span>
+  </label>
+  <button type="submit">Upload &amp; restore</button>
+</form>
+
+<h2>Past runs</h2>
+{{if .Runs}}
+<table class="runs">
   <thead>
-    <tr>
-      <th data-sort="string">Name</th>
-      <th data-sort="string">Kind</th>
-      <th data-sort="string">Source</th>
-      <th data-sort="string">Last status</th>
-      <th data-sort="number">Baseline</th>
-      <th data-sort="number">Last rehearsed</th>
-      <th data-sort="number">Next due</th>
-    </tr>
+    <tr><th>Archive</th><th>Uploaded</th><th>Size</th><th>Status</th><th>Image</th><th></th></tr>
   </thead>
   <tbody>
-  {{range .Repos}}
+    {{range .Runs}}
     <tr>
-      <td data-sort-value="{{.Name}}">
-        <a href="/repo/{{.ID}}"><strong>{{.Name}}</strong></a>
-        {{if not .Enabled}}<span class="chip chip-muted">disabled</span>{{end}}
+      <td><a href="/run/{{.ID}}">{{.OriginalName}}</a></td>
+      <td title="{{fmtTime .UploadedAt}}">{{agoT .UploadedAt}}</td>
+      <td>{{fmtSize .SizeBytes}}</td>
+      <td>
+        {{if eq .Status "running"}}<span class="chip chip-ok">running</span>
+        {{else if eq .Status "stopped"}}<span class="chip chip-muted">stopped</span>
+        {{else if eq .Status "failed"}}<span class="chip chip-danger">failed</span>
+        {{else if eq .Status "extracted"}}<span class="chip chip-warn">extracted</span>
+        {{else}}<span class="chip chip-muted">{{.Status}}</span>{{end}}
       </td>
-      <td data-sort-value="{{.Kind}}"><code>{{.Kind}}</code></td>
-      <td data-sort-value="{{.SourcePath}}"><code>{{.SourcePath}}</code></td>
-      <td data-sort-value="{{.LastStatus}}">
-        {{if eq .LastStatus "pass"}}<span class="chip chip-ok">pass</span>
-        {{else if eq .LastStatus "degraded"}}<span class="chip chip-warn">degraded</span>
-        {{else if eq .LastStatus "fail"}}<span class="chip chip-danger">fail</span>
-        {{else}}<span class="chip chip-muted">pending</span>{{end}}
-      </td>
-      <td data-sort-value="{{.BaselineFiles}}">
-        {{if gt .BaselineFiles 0}}
-          {{.BaselineFiles}} files <span class="muted small">({{humanBytes .BaselineBytes}})</span>
-        {{else}}
-          <span class="muted">—</span>
-        {{end}}
-      </td>
-      <td data-sort-value="{{.LastRehearsedAt.Unix}}">{{agoT .LastRehearsedAt}}</td>
-      <td data-sort-value="{{.NextDueAt.Unix}}">
-        {{if .NextDueAt.IsZero}}<span class="muted">—</span>{{else}}{{fmtTime .NextDueAt}}{{end}}
-      </td>
+      <td class="muted small">{{.Image}}</td>
+      <td><a href="/run/{{.ID}}">View</a></td>
     </tr>
-  {{end}}
+    {{end}}
   </tbody>
 </table>
+{{else}}
+<div class="empty">No runs yet. Drop an AppData Backup archive above to get started.</div>
 {{end}}
 
-<script src="/static/dashboard.js" defer></script>
+<script src="/static/dashboard.js"></script>
 {{end}}
